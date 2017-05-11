@@ -36,11 +36,16 @@ struct portdesc {
 	char *desc;
 };
 
-void fork_drones(void);
+int fork_drones(char* devicestr);
 int get_options(char *argv[], int argc);
 void help(char *me);
+void versioninfo();
 void get_hosts_from_file(FILE *fd);
 void get_drones_from_file(FILE *fd);
+void get_ports_from_file(FILE *fd);
+int get_drone_ports_from_file(FILE *fd, uint16_t *listenerport, uint16_t *senderport);
 void signal_handler(int sig);
+void cleanup();
+void increase_debuglevel();
 
 #endif

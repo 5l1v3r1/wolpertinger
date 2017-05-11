@@ -1,0 +1,272 @@
+#!/bin/bash
+#
+# Script to start/stop wolpertinger drones
+# 2009-08-04 Christian Eichelmann
+# 2013-07-18 Finn Steglich
+#
+# wolperctl <start|stop|status|restart>
+#
+
+
+WOLPERDRONE="$(which wolperdrone)"
+WOLPERDRONE_NAME='wolperdrone'
+CONFIG_PATH='__WOLPER_SYSCONF_DIR__/wolper.conf'
+DEFAULT_DRONE_USERPASSFILE='__WOLPER_SYSCONF_DIR__/wolper.secret'
+DEFAULT_DRONE_USER='default'
+DEFAULT_DRONE_PASS="$(</dev/urandom tr -dc A-Za-z0-9 | head -c20)" # randomized!
+
+# color magic:
+GREEN="[32m"
+RED="[31m"
+RETURN="[0m"
+
+# In the config file, following values should be defined
+# (these are also the default values we write to the config 
+# file if it does not exist):
+PID_DIR='__WOLPER_STATE_DIR__/run/wolpertinger'
+NAME_SENDER="wolper-send"
+NAME_LISTENER="wolper-listen"
+LISTENER_PORT="6001"
+SENDER_PORT="6002"
+INTERFACE="eth0"
+DRONE_USERPASSFILE="${DEFAULT_DRONE_USERPASSFILE}"
+
+
+function read_conf() {
+	
+	# commented lines, empty lines und lines of the form
+    #   choose_ANYNAME='any.:Value' are valid
+	CONFIG_SYNTAX="^\s*#|^\s*$|^[a-zA-Z_]+='[^']*'$"
+
+	if [[ ! -f "${CONFIG_PATH}" ]]; then
+		echo "Warning: Could not find config file ${CONFIG_PATH}. Writing it." >&2
+		cat > "${CONFIG_PATH}" <<-EOF
+			# This file has been automatically created by wolperctl and
+			# can be changed to your needs
+			
+			PID_DIR='$PID_DIR'
+			NAME_SENDER='$NAME_SENDER'
+			NAME_LISTENER='$NAME_LISTENER'
+			LISTENER_PORT='$LISTENER_PORT'
+			SENDER_PORT='$SENDER_PORT'
+			INTERFACE='$INTERFACE'
+			DRONE_USERPASSFILE='${DRONE_USERPASSFILE}'
+		EOF
+	fi
+	if [[ ! -r "${CONFIG_PATH}" ]]; then
+		echo "Warning: Could not read config file ${CONFIG_PATH}. Skipping it." >&2
+		return 2
+	fi
+
+	# check if the file contains something we don't want
+	if egrep -q -v "${CONFIG_SYNTAX}" "${CONFIG_PATH}"; then
+		echo "Error parsing config file ${CONFIG_PATH}." >&2
+		echo "The following lines in the configfile do not fit the syntax:" >&2
+		egrep -vn "${CONFIG_SYNTAX}" "${CONFIG_PATH}"
+		exit 5
+	fi
+
+	# otherwise go on and source it:
+	source "${CONFIG_PATH}"
+}
+
+# r00t p0w3r r3qu1r3d!!1
+if [ "${UID}" -gt "0" ]; then
+    echo "only root can run this script"
+    exit 1
+fi
+
+# read config file
+read_conf
+
+# secret file for credentials
+function test_secret() {
+	secretfile="${1}"
+	
+	if [[ ! -f "${secretfile}" ]]; then
+		if [[ "${secretfile}x" == "${DEFAULT_DRONE_USERPASSFILE}x" ]]; then
+			echo "Warning: Could not find user/password file ${secretfile}. It is default, so we create it." >&2
+			echo "${DEFAULT_DRONE_USER}:${DEFAULT_DRONE_PASS}" > "${secretfile}"
+			chmod 600 "${secretfile}"
+		else
+			echo "Error: Could not find user/password file ${secretfile}. Check your config file. Exit." >&2
+			exit 10
+		fi
+	else
+		if [[ "$(ls -la "${secretfile}" | cut -d ' ' -f 1)" != "-rw-------" ]]; then
+			echo "Error: user/password file ${secretfile} has too open permissions != 600. Exit." >&2
+			exit 11
+		fi
+	fi
+}
+
+# check file for pid and return according to pid process existence
+function check_pid() {
+	pidfile="${1}"
+	if [ -f "${pidfile}" ]; then	
+
+		# check for pid. if not exist, delete pid file
+		pid="$(cat ${pidfile} 2> /dev/null)"
+        if [ -z "$pid" ] || [ -z "$(ps -p "$pid" | awk '/'${WOLPERDRONE_NAME}'/ {print $4}')" ]; then
+           	# no process with this pid -> delete
+			rm -f "${pidfile}"
+			return 1
+        else
+			return 0
+		fi
+	else
+		return 1
+	fi
+}
+
+mkdir -p "${PID_DIR}"
+
+usage()
+{
+    echo "usage: $0 <start|stop|restart|status>"
+    exit 1
+}
+
+start_drones()
+{
+	# testing secretfile
+	test_secret "${DRONE_USERPASSFILE}"
+
+	### SENDER DRONE ###
+
+	# Check for process already running
+	if [ "$(pgrep -f "${WOLPERDRONE} -S" | wc -l)" -gt "0" ]; then
+		echo "${NAME_SENDER} already running"
+		exit 1
+	fi
+
+	# Check for pid file
+	if check_pid "${PID_DIR}/${NAME_SENDER}"; then
+		echo "${NAME_SENDER} already running"
+		exit 1
+    fi
+
+	# Starting
+	echo -n "Starting ${NAME_SENDER} : "
+	${WOLPERDRONE} -S -i ${INTERFACE} -p ${SENDER_PORT} --keyfile "${DRONE_USERPASSFILE}" --pidfile "${PID_DIR}/${NAME_SENDER}" -D
+
+	if check_pid "${PID_DIR}/${NAME_SENDER}"; then
+		echo "[ ${GREEN}OK${RETURN} ]"
+	else
+		echo "[ ${RED}FAILED${RETURN} ]"
+    fi
+
+	### LISTENER DRONE ###
+
+    # Check for process already running
+    if [ "$(pgrep -f "${WOLPERDRONE} -L" | wc -l)" -gt "0" ]; then
+		echo "${NAME_LISTENER} already running"
+		exit 1
+    fi
+
+    # Check for pid file
+    if check_pid "${PID_DIR}/${NAME_LISTENER}"; then 
+       echo "${NAME_LISTENER} already running"
+       exit 1
+    fi
+
+    # Starting
+    echo -n "Starting ${NAME_LISTENER} : "
+    ${WOLPERDRONE} -L -i ${INTERFACE} -p ${LISTENER_PORT} --keyfile "${DRONE_USERPASSFILE}" --pidfile "${PID_DIR}/${NAME_LISTENER}" -D
+
+    if check_pid "${PID_DIR}/${NAME_LISTENER}"; then
+        echo "[ ${GREEN}OK${RETURN} ]"
+    else
+        echo "[ ${RED}FAILED${RETURN} ]"
+    fi
+}
+
+stop_drones() {
+	### SENDER DRONE ###
+
+	# Check for pid file
+    if check_pid "${PID_DIR}/${NAME_SENDER}"; then
+		echo -n "Stopping ${NAME_SENDER} : "
+        kill -9 `cat ${PID_DIR}/${NAME_SENDER}`
+
+		# check if process is gone
+	    if [ "$(pgrep "${WOLPERDRONE} -S" | wc -l)" -eq "0" ]; then
+	        echo "[ ${GREEN}OK${RETURN} ]"
+    		rm -f "${PID_DIR}/${NAME_SENDER}"
+	    else
+	        echo "[ ${RED}FAILED${RETURN} ]"
+	    fi
+	else
+        # no process running
+        echo "${NAME_SENDER} not running"
+    fi
+
+	### LISTENER DRONE ###
+
+	# Check for pid file
+    if check_pid "${PID_DIR}/${NAME_LISTENER}"; then
+		echo -n "Stopping ${NAME_LISTENER} : "
+		kill -9 `cat ${PID_DIR}/${NAME_LISTENER}`
+
+        # check if process is gone
+        if [ "$(pgrep "${WOLPERDRONE} -L" | wc -l)" -eq "0" ]; then
+            echo "[ ${GREEN}OK${RETURN} ]"
+            rm -f "${PID}/${NAME_LISTENER}"
+        else
+            echo "[ ${RED}FAILED${RETURN} ]"
+        fi
+	else
+        # no process running
+        echo "${NAME_LISTENER} not running"
+    fi
+}
+
+status_drones() {
+    ### SENDER DRONE ###
+
+    echo -n "${NAME_SENDER} : "
+
+    # Check for pid file
+    if check_pid "${PID_DIR}/${NAME_SENDER}"; then
+		echo "[ ${GREEN}OK${RETURN} ]"
+	else
+        echo "[ ${RED}DOWN${RETURN} ]"
+    fi
+
+
+    ### LISTENER DRONE ###
+
+	echo -n "${NAME_LISTENER} : "
+
+    # Check for pid file
+    if check_pid "${PID_DIR}/${NAME_LISTENER}"; then
+		echo "[ ${GREEN}OK${RETURN} ]"
+	else
+        echo "[ ${RED}DOWN${RETURN} ]"
+    fi
+}
+
+if [ "$#" -lt "1" ]; then
+    usage
+fi
+
+case "$1" in
+    "start")
+        start_drones
+        ;;
+    "stop")
+        stop_drones
+        ;;
+    "restart")
+        stop_drones
+        sleep 1
+        start_drones
+        ;;
+    "status")
+        status_drones
+        ;;
+    *)
+        usage
+        ;;
+esac
+

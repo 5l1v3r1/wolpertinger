@@ -1,4 +1,11 @@
-CREATE TABLE default_ports (
+CREATE TABLE "options" (
+	key text PRIMARY KEY,
+	value text
+);
+INSERT INTO "options" (key, value) VALUES ('db_version', '0.8.7+');
+
+CREATE TABLE "default_ports" (
+	protocol varchar(64) DEFAULT 'TCP',
 	port_string varchar(32)
 );
 
@@ -22,11 +29,12 @@ CREATE TABLE host_table (
 	ref_count integer default 1
 );
 
-CREATE TABLE result (
+CREATE TABLE "result" (
+	protocol varchar(64) DEFAULT 'TCP',
 	port integer, 
 	host_id references host(id), 
-	scan_id references scan(id), 
-	primary key(port, host_id, scan_id)
+	scan_id references scan(id),
+	PRIMARY KEY(protocol, port, host_id, scan_id)
 );
 
 CREATE TABLE scan (
@@ -38,7 +46,8 @@ CREATE TABLE scan (
 	source_ip integer, 
 	source_port integer, 
 	start_time date, 
-	end_time date
+	end_time date,
+	status varchar(64) DEFAULT 'UNKNOWN'
 );
 
 CREATE TABLE drone_credentials (
@@ -48,10 +57,12 @@ CREATE TABLE drone_credentials (
 	password varchar(128)
 );
 
-CREATE TABLE services (
-	name varchar(64), 
-	port integer primary key, 
-	description varchar(128)
+CREATE TABLE "services" (
+	name varchar(64),
+    protocol varchar(64) DEFAULT 'TCP',
+	port integer, 
+	description varchar(128),
+    PRIMARY KEY(protocol, port)
 );
 
 CREATE VIEW host as select * from host_table;

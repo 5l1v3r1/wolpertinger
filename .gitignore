@@ -1,0 +1,11 @@
+*~
+*.backup
+.cproject
+.project
+.ropeproject/
+.settings/
+build/
+push.sh
+testdata/
+src/.dirstamp
+

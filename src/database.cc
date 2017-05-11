@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -34,6 +35,15 @@
 #include "database.h"
 
 extern struct global_informations global;
+
+
+static sqlite3 *db;											// SQLite Datenbank
+static uint32_t scan_id;									// Portscan ID
+static char default_port_string[MAX_DEFAULT_PORTSTR_LEN];	// default port string
+static char *pport_string = default_port_string;			// pointer to default_port_string
+static char **credentials;									// drone credentials
+static char db_version[MAX_STRING_LEN];						// version string of the db schema
+
 
 // callback for retreiving an integer
 static int get_int_cb(void *param, int argc, char **argv, char **azColName){	
@@ -54,10 +64,8 @@ static int get_string_cb(void *param, int argc, char **argv, char **azColName){
 	return 0;
 }
 
+// callback for retreiving drone credentials
 static int get_drone_credentials_cb(void *param, int argc, char **argv, char **azColName){
-	uint32_t i;
-	uint32_t len = 0;
-
 	if (argc != 2) {
 		credentials = NULL;
 		return 0;
@@ -76,13 +84,11 @@ static int get_drone_credentials_cb(void *param, int argc, char **argv, char **a
 }
 
 // callback for retreiving the default port list
-static int get_portlist_cb(void *param, int argc, char **argv, char **azColName){		
-	uint32_t i;
+static int get_portlist_cb(void *param, int argc, char **argv, char **azColName){
 	uint32_t len = 0;
 	char buffer[MAX_STRING_LEN];
-	char *p = (char *)param;
 	
-	for (i = 0; i < argc; i++) {		
+	for (int i = 0; i < argc; i++) {		
 		snprintf(buffer, MAX_STRING_LEN, "%s,", argv[i]);
 		len = strlen(buffer);
 
@@ -97,13 +103,12 @@ static int get_portlist_cb(void *param, int argc, char **argv, char **azColName)
 
 
 // callback for creating a scan report
-static int create_report_cb(void *param, int argc, char **argv, char **azColName){		
-	uint32_t i;
-	uint32_t port;
-	char *service;
+static int create_report_cb(void *param, int argc, char **argv, char **azColName){
+	uint32_t port = 0;
+	char *service = NULL;
 	struct in_addr addr;
 			
-	for (i = 0; i < argc; i++) {		
+	for (int i = 0; i < argc; i++) {		
 		service = NULL;
 		if (strcmp(azColName[i], "ip") == 0) {
 			addr.s_addr = strtoul(argv[i], NULL, 10);			
@@ -115,10 +120,10 @@ static int create_report_cb(void *param, int argc, char **argv, char **azColName
 	}	
 
 	if (service) {
-		printf("OPEN %-16s%-6d[%s]\n", inet_ntoa(addr), port, service);		
+		printf("OPEN %-16s%6d/tcp [%s]\n", inet_ntoa(addr), port, service);		
 		free(service);
 	} else {
-		printf("OPEN %-16s%-6d\n", inet_ntoa(addr), port);				
+		printf("OPEN %-16s%6d/tcp\n", inet_ntoa(addr), port);				
 	}	
 	
 	return 0;
@@ -141,14 +146,6 @@ int db_open(void) {
     if (FILE * file = fopen(homepath, "r")) {
 		/* file exists, open database */
 		fclose(file);
-		rc = sqlite3_open(homepath, &db);
-		if (rc) {
-			fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
-			sqlite3_close(db);
-			exit(1);
-		}
-
-		return rc;        
     } else {
 		/* file doesn't exist. copy it from PKGDATADIR */
 		printf("wolpertinger.db does not exist. creating a new one in homedir.\n");
@@ -157,25 +154,60 @@ int db_open(void) {
 		path_len = strlen(getenv("HOME")) + strlen(DATABASE_HOME) + 3;
 		homepathdir = (char *) safe_zalloc (path_len);
 		snprintf(homepathdir, path_len, "%s%s", getenv("HOME"), DATABASE_HOME);
-		mkdir(homepathdir, 0700);
-
+		if ((mkdir(homepathdir, 0700) < 0) && (errno != EEXIST)) {
+			MSG(MSG_WARN, "mkdir failed: %s\n", strerror(errno));
+		}
+		free(homepathdir);
+        
 		/* copy file from PKGDATADIR */
 		path_len = strlen(PACKAGE_DATA_DIR) + strlen(DATABASE) + 3;
 		path = (char *)safe_zalloc(path_len);
 		snprintf(path, path_len, "%s/%s", PACKAGE_DATA_DIR, DATABASE);
-		file_copy(path, homepath);	
-		chmod(homepath, 0700);
-
-		/* open database in homedir */
-		rc = sqlite3_open(homepath, &db);
-		if (rc) {
-			fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
-			sqlite3_close(db);
-			exit(1);
+		file_copy(path, homepath);
+		free(path);
+		
+		if (chmod(homepath, 0700) < 0) {
+			MSG(MSG_WARN, "chmod failed: %s\n", strerror(errno));
 		}
-
-		return rc;
 	}
+
+	/* open database in homedir */
+	rc = sqlite3_open(homepath, &db);
+	if (rc) {
+		fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+		sqlite3_close(db);
+		exit(1);
+	}
+	
+	free(homepath);
+
+	/* check database schema version */
+	db_find_version();
+    //MSG(MSG_WARN, "database schema version: %s\n", db_version);
+	
+	return 0;
+}
+
+int db_find_version(void) {
+	char *zErrMsg = NULL;
+	int rc;	
+	
+	rc = sqlite3_exec(db, "SELECT value FROM options WHERE key='db_version';", &get_string_cb, db_version, &zErrMsg);
+	if (rc != SQLITE_OK) {
+		//MSG(MSG_WARN, "expected SQL error: %s\n", zErrMsg);
+		sqlite3_free(zErrMsg);
+		snprintf(db_version, MAX_STRING_LEN, "0.7+");
+	}
+
+    if ((strncmp(db_version, "0.7+", MAX_STRING_LEN) == 0) || (strncmp(db_version, "0.8.3+", MAX_STRING_LEN) == 0) || (strncmp(db_version, "0.8.5+", MAX_STRING_LEN) == 0)) {
+		MSG(MSG_WARN, "Your wolpertinger database structure is deprecated.\n  You should use wolper-mcp.py --update-db to update the structure of your current database\n  or wolper-mcp.py --reset-db to delete your database and use a new one instead.\n");
+    } else if (strncmp(db_version, "0.8.7+", MAX_STRING_LEN) == 0) {
+        //MSG(MSG_WARN, "This is the latest database structure version.\n");
+	} else {
+		MSG(MSG_ERR, "Unknown database version. You may use wolper-mcp.py --reset-db to delete your database and use a new one instead.\n");
+    }
+	
+	return rc;
 }
 
 
@@ -183,15 +215,13 @@ int db_open(void) {
 int db_write(char *sql_stmt) {
 	int rc;
 	char *zErrMsg = 0;
+	
+	MSG(MSG_DBG, "SQL write statement: %s\n", sql_stmt);
+	
 	rc = sqlite3_exec(db, sql_stmt, 0, 0, &zErrMsg);
 	if (rc != SQLITE_OK) {
-		// ignore uniqueness error messages, because the database handles this
-		if (strstr(zErrMsg, "unique") != NULL) {
-			return rc;
-		}
-		
 		// print SQL error message
-		MSG(MSG_WARN, "SQL error: %s\n", zErrMsg);
+		MSG(MSG_WARN, "SQL error: %s\n  Statement skipped: %s\n", zErrMsg, sql_stmt);
 		sqlite3_free(zErrMsg);
 	}
 	
@@ -203,7 +233,9 @@ int db_write(char *sql_stmt) {
 int db_read(char *sql_stmt, void *var, int (*callback)(void*, int, char**, char**)) {
 	int rc;
 	char *zErrMsg = 0;
-		
+
+	MSG(MSG_DBG, "SQL read statement: %s\n", sql_stmt);
+			
 	rc = sqlite3_exec(db, sql_stmt, callback, var, &zErrMsg);
 	if (rc != SQLITE_OK) {
 		MSG(MSG_WARN, "SQL error: %s\n", zErrMsg);
@@ -215,29 +247,44 @@ int db_read(char *sql_stmt, void *var, int (*callback)(void*, int, char**, char*
 
 
 /* close database */
-void db_close(void) {
-	sqlite3_close(db);
+int db_close(void) {
+	int rc;
+	sqlite3_stmt * stmt;
+	
+	MSG(MSG_DBG, "SQL close database\n");
+
+	// finish all remaining statements
+	while ((stmt = sqlite3_next_stmt(db, NULL)) != NULL) {
+		sqlite3_finalize(stmt);
+	}
+	
+	rc = sqlite3_close(db);
+	if (rc != SQLITE_OK) {
+		MSG(MSG_WARN, "SQL error while closing database: %i\n", rc);
+	}
+	
+	return rc;
 }
 
 
 /* create scan */
-int db_create_scan(struct timeb *time, struct info *scan_info) {
+int db_create_scan(mytime_t starttime, mytime_t estendtime, struct info *scan_info) {
 	char sql_stmt[MAX_STMT_LEN];
-		
-	// better SQL input validation needed!
-	//if (strchr(dl->get_cmd_line(), 0x27) != NULL)
-	//	return 0;
 	
-	// insert new scan (with source IP 0.0.0.0)
-	snprintf(sql_stmt, MAX_STMT_LEN, "insert into scan (tag, pps, hosts, ports, source_ip, source_port, start_time, end_time) "
-	                                 "values ('%s', %u, %u, %u, %u, %u, %jd, %jd)", 
-	         						  scan_info->scan_tag, scan_info->pps, scan_info->num_hosts, scan_info->num_ports, scan_info->source_ip, scan_info->source_port, (intmax_t)time->time, (intmax_t)time->time);
+	// insert new scan
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "insert into scan (tag, pps, hosts, ports, source_ip, source_port, start_time, end_time) values (%Q, %u, %u, %u, %u, %u, %llu, %llu)", scan_info->scan_tag, scan_info->pps, scan_info->num_hosts, scan_info->num_ports, scan_info->source_ip, scan_info->source_port, starttime, estendtime);
 	db_write(sql_stmt);
-			
+	
 	// get ID of new scan
-	snprintf(sql_stmt, MAX_STMT_LEN, "select id from scan where start_time=%jd", (intmax_t)time->time);
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "select id from scan where start_time=%llu", starttime);
 	db_read(sql_stmt, &scan_id, &get_int_cb);
-		
+
+	if ((strncmp(db_version, "0.8.5+", MAX_STRING_LEN) == 0) || (strncmp(db_version, "0.8.7+", MAX_STRING_LEN) == 0)) {
+		// set scan state to RUNNING
+		sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "update scan set status='RUNNING' where id=%u", scan_id);
+		db_write(sql_stmt);
+	}
+	
 	return scan_id;
 }
 
@@ -246,7 +293,7 @@ int db_set_listener(uint32_t ip) {
 	char sql_stmt[MAX_STMT_LEN];
 
 	// add listener address (scan address) to scan
-	snprintf(sql_stmt, MAX_STMT_LEN, "update scan set source_ip=%u where id=%u", ip, scan_id);
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "update scan set source_ip=%u where id=%u", ip, scan_id);
 	db_write(sql_stmt);
 
 	return 0;
@@ -258,16 +305,16 @@ int db_add_drone(uint32_t ip, uint16_t port, uint32_t type) {
 	char sql_stmt[MAX_STMT_LEN];
 	uint32_t drone_id = 0;
 	
-	// add drone
-	snprintf(sql_stmt, MAX_STMT_LEN, "insert into drone (ip) values (%u)", ip);
+	// add drone if not exists
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "insert or ignore into drone (ip) values (%u)", ip);
 	db_write(sql_stmt);	
 
 	// get ID of new drone
-	snprintf(sql_stmt, MAX_STMT_LEN, "select id from drone where ip=%u", ip);
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "select id from drone where ip=%u", ip);
 	db_read(sql_stmt, &drone_id, &get_int_cb);
 
 	// drone usage
-	snprintf(sql_stmt, MAX_STMT_LEN, "insert into drone_usage (drone_id, port, type, scan_id) values (%u, %u, %u, %u)", drone_id, port, type, scan_id);			
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "insert into drone_usage (drone_id, port, type, scan_id) values (%u, %u, %u, %u)", drone_id, port, type, scan_id);			
 	db_write(sql_stmt);
 
 	return 0;
@@ -282,7 +329,7 @@ int db_add_drone_credentials(uint8_t *uuid, char *username, char *password) {
 	for (i=0, p = uuid_str; i <  UUID_LEN; i++, p += 2)
 		sprintf(p, "%02x", uuid[i]);
 	
-	snprintf(sql_stmt, MAX_STMT_LEN, "insert into drone_credentials (uuid, username, password) values ('%s', '%s', '%s')", uuid_str, username, password);
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "insert into drone_credentials (uuid, username, password) values (%Q, %Q, %Q)", uuid_str, username, password);
 
 	db_write(sql_stmt);
 
@@ -290,44 +337,73 @@ int db_add_drone_credentials(uint8_t *uuid, char *username, char *password) {
 }
 
 /* store result */
-int db_store_result(uint32_t ip, uint16_t port) {
+int db_store_tcp_result(uint32_t ip, uint16_t port) {
 	char sql_stmt[MAX_STMT_LEN];
 	uint32_t host_id = 0;
 	
-	// add host
-	snprintf(sql_stmt, MAX_STMT_LEN, "insert into host (ip) values (%u)", ip);
+	// add host if not exists
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "insert or ignore into host (ip) values (%u)", ip);
 	db_write(sql_stmt);	
 	
 	// get ID of new host
-	snprintf(sql_stmt, MAX_STMT_LEN, "select id from host where ip=%u", ip);
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "select id from host where ip=%u", ip);
 	db_read(sql_stmt, &host_id, &get_int_cb);
 	
 	// add result
-	snprintf(sql_stmt, MAX_STMT_LEN, "insert into result (port, host_id, scan_id) values (%u, %u, %u)", port, host_id, scan_id);
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "insert or ignore into result (port, host_id, scan_id) values (%u, %u, %u)", port, host_id, scan_id);
 	db_write(sql_stmt);	
 
 	return 0;
 }
 
 
-/* finish scan */
-int db_finish_scan(struct timeb *time) {
+/* cancel scan */
+int db_cancel_scan(mytime_t time) {
 	char sql_stmt[MAX_STMT_LEN];
 	
 	// update end time
-	snprintf(sql_stmt, MAX_STMT_LEN, "update scan set end_time=%jd where id=%u", (intmax_t) time->time, scan_id);
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "update scan set end_time=%llu where id=%u", time, scan_id);
 	db_write(sql_stmt);
+
+	if ((strncmp(db_version, "0.8.5+", MAX_STRING_LEN) == 0) || (strncmp(db_version, "0.8.7+", MAX_STRING_LEN) == 0)) {
+		// set scan state to CANCELED
+		sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "update scan set status='CANCELED' where id=%u", scan_id);
+		db_write(sql_stmt);
+	}
+
+	return 0;
+}
+
+/* finish scan */
+int db_finish_scan(mytime_t time) {
+	char sql_stmt[MAX_STMT_LEN];
 	
+	// update end time
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "update scan set end_time=%llu where id=%u", time, scan_id);
+	db_write(sql_stmt);
+
+	if ((strncmp(db_version, "0.8.5+", MAX_STRING_LEN) == 0) || (strncmp(db_version, "0.8.7+", MAX_STRING_LEN) == 0)) {
+		// set scan state to FINISHED if database allows it
+		sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "update scan set status='FINISHED' where id=%u", scan_id);
+		db_write(sql_stmt);
+	}
+
 	return 0;
 }
 
 
-/* get default ports */
-char *db_get_default_ports(void) {
+/* get default TCP ports */
+char *db_get_default_tcp_ports(void) {
 	char sql_stmt[MAX_STMT_LEN];
 		
-	// get all default ports
-	snprintf(sql_stmt, MAX_STMT_LEN, "select port_string from default_ports");
+	// get all default TCP ports
+	if (strncmp(db_version, "0.7+", MAX_STRING_LEN) == 0) {
+		sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "select port_string from default_ports");
+	} else if ((strncmp(db_version, "0.8.3+", MAX_STRING_LEN) == 0) || (strncmp(db_version, "0.8.5+", MAX_STRING_LEN) == 0) || (strncmp(db_version, "0.8.7+", MAX_STRING_LEN) == 0)) {
+		sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "select port_string from default_ports where protocol='TCP'");
+	} else {
+		MSG(MSG_ERR, "Unknown database version, cannot get default ports\n");
+	}
 	db_read(sql_stmt, default_port_string, &get_portlist_cb);
 
 	// delete last comma
@@ -348,7 +424,7 @@ char **db_get_drone_credentials(uint8_t *uuid) {
 	credentials = NULL;
 	
 	// get credentials for uuid
-	snprintf(sql_stmt, MAX_STMT_LEN, "select username, password from drone_credentials where uuid=\"%s\"", uuid_str);
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "select username, password from drone_credentials where uuid=%Q", uuid_str);
 	db_read(sql_stmt, credentials, &get_drone_credentials_cb);
 
 	//fprintf(stderr, "credentials[0] = %s\n", credentials[0]);
@@ -364,8 +440,12 @@ char *db_create_report(uint32_t id) {
 	if (id == 0)
 		id = scan_id;
 	
-	// get scan results
-	snprintf(sql_stmt, MAX_STMT_LEN, "select r.port as port,h.ip as ip,s.name as name from result as r, host as h, services as s where scan_id=%u and r.host_id=h.id and r.port=s.port order by h.ip asc, r.port asc", id);
+	// get scan results (TCP only)
+	if (strncmp(db_version, "0.7+", MAX_STRING_LEN) == 0) {
+		sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "select r.port as port,h.ip as ip,s.name as name from result as r, host as h, services as s where scan_id=%u and r.host_id=h.id and r.port=s.port order by h.ip asc, r.port asc", id);
+	} else if ((strncmp(db_version, "0.8.3+", MAX_STRING_LEN) == 0) || (strncmp(db_version, "0.8.5+", MAX_STRING_LEN) == 0) || (strncmp(db_version, "0.8.7+", MAX_STRING_LEN) == 0)) {
+		sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "select r.port as port,h.ip as ip,s.name as name from result as r, host as h, services as s where scan_id=%u and r.host_id=h.id and r.port=s.port and r.protocol=s.protocol and r.protocol='TCP' order by h.ip asc, r.port asc", id);
+	}
 	db_read(sql_stmt, 0, &create_report_cb);
 
 	return 0;
@@ -376,7 +456,7 @@ char *db_set_savepoint(void) {
 	char sql_stmt[MAX_STMT_LEN];
 	
 	// add savepoint
-	snprintf(sql_stmt, MAX_STMT_LEN, "begin transaction");
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "begin transaction");
 	db_write(sql_stmt);	
 
 	return 0;
@@ -387,7 +467,7 @@ char *db_rollback(void) {
 	char sql_stmt[MAX_STMT_LEN];
 	
 	// rollback
-	snprintf(sql_stmt, MAX_STMT_LEN, "rollback transaction");
+	sqlite3_snprintf(MAX_STMT_LEN, sql_stmt, "rollback transaction");
 	db_write(sql_stmt);	
 
 	return 0;

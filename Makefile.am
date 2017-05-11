@@ -1,10 +1,10 @@
 ## Process this file with automake to produce Makefile.in
-## Created by Anjuta
 
 SUBDIRS = src \
 	docs\
 	data\
-	scripts
+	scripts\
+    test
 
 # Copy all the spec files. Of cource, only one is actually used.
 dist-hook:

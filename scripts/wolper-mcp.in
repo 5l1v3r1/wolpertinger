@@ -1,0 +1,698 @@
+#!/usr/bin/env python2
+# -*- coding: UTF-8 -*-
+
+"""Master Control Program for the wolpertinger portscanner"""
+
+import getopt
+import os
+import sqlite3
+import sys
+import codecs
+import warnings
+import shutil
+
+sys.stdout = codecs.getwriter('utf8')(sys.stdout)
+
+from datetime import datetime
+from socket import inet_aton, inet_ntoa
+from struct import pack, unpack
+
+# disable warnings
+warnings.filterwarnings("ignore")
+
+# VARIABLES & CONSTANTS
+USER_HOME = os.path.expanduser("~")                             # get home directory of user
+DATABASE = USER_HOME + "/.wolpertinger/wolpertinger.db"         # default database file
+DATA_DIR_DATABASE = "__WOLPER_DATA_DIR__" + "/wolpertinger.db"  # pre-generated database
+IDENT_SENDER = 1                                                # sender identifier
+IDENT_LISTENER = 2                                              # listener identifier
+TIME_FMT = "%H:%M:%S"                                           # time format
+DATE_FMT = "%Y-%m-%d"                                           # date format
+DATETIME_FMT = "%Y-%m-%d %H:%M:%S"                              # datetime format
+IP_LUT = {}                                                     # IP lookup table
+
+SUMMARY_LAYOUT="%-05s %-020s %-010s %-06s %-07s %-07s %-020s %-020s %-012s %-07s"
+SUMMARY_HEADER=("Id", "Tag", "State", "Hosts", "Ports", "pps", "Start", "End", "Total", "Open")
+
+DATABASE_VERSIONS=["0.7+", "0.8.3+", "0.8.5+", "0.8.7+"]
+
+class wolper_mcp():
+    """Wolpertinger Master Control Program"""
+
+    def __init__(self, db_file = DATABASE):
+        self.db_file = db_file
+        self.db_conn = None # we open the database on demand
+        self.db_cursor = None
+        self.db_version='unknown'
+
+        self.line_by_line = False
+
+        self.modules = {}
+
+        # load wolper-mcp modules
+        mod_name = 'WolperOutput'
+        mod_path = "__WOLPER_DATA_DIR__" + "/modules"
+
+        sys.path.append(mod_path)
+        flist = os.listdir(mod_path)
+
+        # no exec and except warnings
+        # pylint: disable=W0122,W0702
+
+        for module in flist:
+            if module.endswith(".py"):
+                module = module[:-3]
+                try:
+                    exec("import " + module)
+                except Exception as e:
+                    sys.stderr.write("unable to load module: %s. skipping.\n" % (module, ))
+                    sys.stderr.write("initial error: %s\n" % (str(e),))
+                    sys.exit(0)
+
+                if mod_name in dir(eval(module)):
+                    self.modules[module] = eval(module + "." + mod_name + "(self)")
+
+    def open_database(self, warn_old_version=True):
+        """ Opens the wolpertinger database and establishes a connection and cursor """
+
+        if self.db_conn and self.db_cursor:
+            return # database was already opened
+
+        if not os.path.isfile(self.db_file):
+            sys.stderr.write("Could not find the wolpertinger database!\n")
+            sys.stderr.write("  You can create a new one with --reset-db.\n")
+            sys.exit(1)
+
+        try:
+            self.db_conn = sqlite3.connect(self.db_file)        # open database connection
+        except sqlite3.OperationalError:
+            sys.stderr.write("Couldn't open wolpertinger database!\n")
+            sys.exit(1)
+
+        self.db_conn.row_factory = sqlite3.Row
+        self.db_cursor = self.db_conn.cursor()                  # get database cursor
+
+        try:                                                    # test a query
+            self.db_cursor.execute("select * from scan limit 1;")
+        except sqlite3.OperationalError:
+            sys.stderr.write("Cannot read relevant tables in the database!\n")
+            sys.exit(1)
+
+        self.find_db_version(warn_old_version)
+
+    def db_version_or_older(self, versionstring):
+        """ Returns true iff the database version is the given version or older """
+
+        myversion = DATABASE_VERSIONS.index(self.db_version)
+        givenversion = DATABASE_VERSIONS.index(versionstring)
+
+        return myversion <= givenversion
+
+    def db_version_or_newer(self, versionstring):
+        """ Returns true iff the database version is the given version or newer """
+
+        myversion = DATABASE_VERSIONS.index(self.db_version)
+        givenversion = DATABASE_VERSIONS.index(versionstring)
+
+        return myversion >= givenversion
+
+    def find_db_version(self, warn_old_version=True):
+        """ Detects the current database schema version """
+
+        try:
+            self.db_cursor.execute("SELECT value FROM options WHERE key='db_version';")
+            self.db_version = self.db_cursor.fetchone()[0]
+        except sqlite3.OperationalError:
+            self.db_version = '0.7+'
+
+        if not self.db_version in DATABASE_VERSIONS:
+            sys.stderr.write("Unknown database version. You may use --reset-db to delete your database and use a new one instead.\n")
+            sys.exit(3)
+        if self.db_version_or_older(DATABASE_VERSIONS[-2]): # last or older
+            if warn_old_version:
+                sys.stderr.write("WARNING: Your wolpertinger database structure is deprecated.\n")
+                sys.stderr.write("  You should use --update-db to update the structure of your current database\n")
+                sys.stderr.write("  or --reset-db to delete your database and use a new one instead.\n")
+        # otherwise this is the latest version
+
+    def show_default_tcp_ports(self):
+        """Show default tcp ports"""
+
+        self.open_database()
+        if self.db_version_or_older('0.7+'):
+            self.db_cursor.execute(r"select port_string from default_ports")
+        elif self.db_version_or_newer('0.8.3+'):
+            self.db_cursor.execute(r"select port_string from default_ports where protocol='TCP'")
+
+        print "=== Default TCP-Ports ==="
+
+        for row in self.db_cursor:
+            print str(row[0])
+
+    def get_portscan_count(self):
+        """Retreive number of portscans in database"""
+
+        count = 0
+
+        self.open_database()
+        self.db_cursor.execute(r"select count(*) from scan")
+
+        for row in self.db_cursor:
+            count = int(row[0])
+
+        return count
+
+    def delete_scan(self, ref_id):
+        """ Delete scan """
+
+        self.open_database()
+        success = False
+
+        # get list of portscans
+        self.db_cursor.execute(r"select id from scan where id =?",  (ref_id, ))
+        for row in self.db_cursor:
+            success = True
+
+        if not success:
+            print "Invalid portscan number!"
+            return
+
+        # delete scan
+        print "[+] deleting scan..."
+        if not self.db_cursor.execute(r"delete from scan where id=?", (ref_id,)).rowcount:
+            print "[+] Error deleting scan"
+            return
+
+        # get host references
+        print "[+] deleting host references..."
+        self.db_cursor.execute(r"select host_id from result where scan_id=?", (ref_id,))
+
+        # decrement host reference count (sqlite trigger)
+        host_id = []
+        for row in self.db_cursor:
+            host_id.append(row['host_id'])
+
+        if not len(host_id):
+            print "[+] Error retrieving host references or no hosts"
+
+        for hid in host_id:
+            self.db_cursor.execute(r"delete from host where id=?", (hid,))
+
+        # delete port entries
+        print "[+] deleting port references..."
+        if not self.db_cursor.execute(r"delete from result where scan_id=?", (ref_id,)).rowcount:
+            print "[+] Error deleting port references or no ports"
+            # but just lets go on for now
+
+        # delete drone information
+        print "[+] deleting drone informations..."
+        if not self.db_cursor.execute(r"delete from drone_usage where scan_id=?", (ref_id,)).rowcount:
+            print "[+] Error deleting drone informations or no drones"
+            # but just lets go on for now
+
+        print "[+] finished"
+        self.db_conn.commit()
+
+    def list_portscans(self, searchstr=""):
+        """List portscans"""
+
+        self.open_database()
+        if searchstr == "":
+            self.db_cursor.execute(r"SELECT *,(SELECT COUNT(scan_id) FROM result WHERE scan_id = id)  FROM scan;")
+            print "\n[+] Scans found in wolpertinger-database:"
+        else:
+            self.db_cursor.execute(r"SELECT *,(SELECT COUNT(scan_id) FROM result WHERE scan_id = id)  FROM scan WHERE tag LIKE ?;", ("%"+searchstr+"%",))
+            print "\n[+] Scans found with string '"+searchstr+"' in wolpertinger-database:"
+
+        print "------------------------------------------------------------------------------------------------------------------------"
+        print SUMMARY_LAYOUT % SUMMARY_HEADER
+        print "------------------------------------------------------------------------------------------------------------------------"
+
+        for row in self.db_cursor:
+            if self.db_version_or_newer('0.8.5+'):
+                status = str(row['status'])
+            else:
+                status = "UNKNOWN"
+            start_time = datetime.fromtimestamp(row['start_time']).strftime(DATETIME_FMT)
+            end_time = datetime.fromtimestamp(row['end_time']).strftime(DATETIME_FMT)
+            time_delta = datetime.fromtimestamp(row['end_time']) - datetime.fromtimestamp(row['start_time'])
+            print SUMMARY_LAYOUT % (row['id'], row['tag'], status, row['hosts'], row['ports'], row['pps'], start_time, end_time, time_delta, row[10 if self.db_version_or_newer('0.8.5+') else 9])
+
+        return
+
+    def get_portscan_results(self, scan_id):
+        """Retrieve results for portscan"""
+
+        self.open_database()
+        hosts = []                                              # host list
+        results = []                                            # result list
+
+        # get scanned hosts
+        self.db_cursor.execute(r"select distinct h.ip from result as r, host as h where scan_id=? and r.host_id=h.id order by h.ip asc", (int(scan_id),))
+
+        for row in self.db_cursor:
+            ip = pack("I", row[0])
+            hosts.append(inet_ntoa(ip))
+
+        # get open tcp ports
+        if self.db_version_or_older('0.7+'):
+            self.db_cursor.execute(r"select r.port, h.ip, s.name from result as r, host as h, services as s where scan_id=? and r.host_id=h.id and r.port=s.port order by h.ip asc, r.port asc", (int(scan_id),))
+        elif self.db_version_or_newer('0.8.3+'):
+            self.db_cursor.execute(r"select r.port, h.ip, s.name from result as r, host as h, services as s where scan_id=? and r.host_id=h.id and r.port=s.port and r.protocol=s.protocol and r.protocol='TCP' order by h.ip asc, r.port asc", (int(scan_id),))
+
+        for row in self.db_cursor:
+            port = int(row[0])
+            ip = pack("I", row[1])
+            service = row[2]
+
+            # store result in results list
+            results.append((port, inet_ntoa(ip), service))
+
+        return results
+
+
+    def get_host_results(self, scan_id, ip):
+        """Get portscan results of specified host"""
+
+        self.open_database()
+        results = []                                            # result list
+
+        # convert IP address
+        ip = unpack("I", inet_aton(ip))[0]
+
+        # get open TCP ports
+        if self.db_version_or_older('0.7+'):
+            self.db_cursor.execute(r"select r.port, s.name from result as r, host as h, services as s where scan_id=? and r.host_id=h.id and r.port=s.port and h.ip=? order by h.ip asc, r.port asc", (int(scan_id), ip))
+        elif self.db_version_or_newer('0.8.3+'):
+            self.db_cursor.execute(r"select r.port, s.name from result as r, host as h, services as s where scan_id=? and r.host_id=h.id and r.port=s.port and r.protocol='TCP' and h.ip=? order by h.ip asc, r.port asc", (int(scan_id), ip))
+
+        for row in self.db_cursor:
+            port = row[0]
+            service = row[1]
+
+            # store result in results list
+            results.append((port, service))
+
+        return results
+
+
+    def get_portscan_info(self, scan_id):
+        """Get portscan information"""
+
+        self.open_database()
+
+        # get and show some portscan statistics
+        self.db_cursor.execute(r"select * from scan where id=? order by id asc", (int(scan_id),))
+
+        for row in self.db_cursor:
+            hosts = row['hosts']                            # number of scanned hosts
+            ports = row['ports']                            # number of scanned ports
+            pps = int(row['pps'])                           # packets per second
+            source_ip = pack("I", row['source_ip'])                 # source IP address
+            source_port = row['source_port']                # source port
+            start_time = datetime.fromtimestamp(row['start_time'])      # start time
+            end_time = datetime.fromtimestamp(row['end_time'])      # end time
+
+            # calculate scan time
+            scan_time = end_time - start_time
+
+            # get scan state if database supports it
+            if self.db_version_or_newer('0.8.5+'):
+                status = str(row['status'])
+            else:
+                status = "UNKNOWN"
+
+        return (hosts, ports, pps, source_ip, source_port, start_time, end_time, scan_time, status)
+
+
+    def get_drones(self, scan_id):
+        """Get drones used for portscan"""
+
+        self.open_database()
+        drones = []                                             # drone list
+
+        # get list of portscans
+        self.db_cursor.execute(r"select d.ip, du.port, du.type from drone as d, drone_usage as du where du.scan_id=? and d.id=du.drone_id order by type", (int(scan_id),))
+
+        for row in self.db_cursor:
+            ip = pack("I", row['ip'])                              # drone IP address
+            port = int(row['port'])                                  # drone port
+            typ = int(row['type'])                                   # drone type
+
+            # local mode
+            if row[0] == 1 or row[0] == 2:
+                drones.append(("local drone", 0, typ))
+            else:
+                drones.append((inet_ntoa(ip), port, typ))
+
+        return drones
+
+
+    def show_portscan(self, ref_id):
+        """Show portscan information"""
+
+        self.open_database()
+
+        hosts = []                                              # host list
+        success = False
+
+        # get list of portscans
+        self.db_cursor.execute(r"select id from scan where id=?",  (int(ref_id), ))
+        for row in self.db_cursor:
+            success = True
+
+        if not success:
+            print "Invalid portscan number!"
+            return
+
+        # get scanned hosts
+        self.db_cursor.execute(r"select distinct h.ip from result as r, host as h where scan_id=? and r.host_id=h.id order by h.ip asc", (int(ref_id),))
+
+        for row in self.db_cursor:
+            ip = pack("I", row[0])
+            hosts.append(inet_ntoa(ip))
+
+        # get and show some portscan statistics
+        info = self.get_portscan_info(ref_id)
+
+        num_hosts = info[0]                             # number of scanned hosts
+        num_ports = info[1]                             # number of scanned ports
+        pps = info[2]                                       # packets per second
+        source_ip = info[3]                                 # source IP address
+        #source_port = info[4]                               # source port
+        start_time = info[5]                                # start time
+        end_time = info[6]                                  # end time
+        status = info[8]                                # scan state
+
+        # calculate scan time
+        scan_time = end_time - start_time
+
+        # get total portscan results
+        total_results = self.get_portscan_results(ref_id)
+
+        # get used drones
+        drones = self.get_drones(ref_id)
+
+        # show default portscan output
+        print "wolpertinger results"
+        print "--------------------"
+        print "Start time:\t\t", start_time.strftime(DATETIME_FMT)
+        print "End time:\t\t", end_time.strftime(DATETIME_FMT), '(estimate)' if status == 'RUNNING' else ''
+        print "Scan time:\t\t", scan_time, '(estimate)' if status == 'RUNNING' else ''
+        print "Scan state:\t\t", status
+        print "Scanned hosts:\t\t", num_hosts
+        print "Scanned ports:\t\t", num_ports
+        print "Open ports:\t\t", len(total_results)
+        print "Source IP:\t\t", inet_ntoa(source_ip)
+        print "Packets per second:\t", pps
+
+        print "Listener drone:\t\t%s (%d/tcp)" % (drones[-1][0], drones[-1][1])
+        print "Sender drone(s):\t",
+
+        for s in drones[:-1]:
+            print "%s (%d/tcp)" % (s[0], s[1]),
+        print "\n"
+
+        # show results for each host
+        for h in hosts:
+            results = self.get_host_results(ref_id, h)
+
+            if self.line_by_line:
+                print "%s:"  % (h, ),
+                for r in results:
+                    print "%s"  % r[0],
+                print ""
+
+            else:
+                print "Open TCP ports on %s:" % (h, )
+
+                # print table header
+                print "PORT\tSERVICE"
+                for r in results:
+                    print "%d\t%s" % (r[0], r[1])
+
+                print
+
+    ###
+    # DATABASE OPERATIONS
+    ###
+
+    def _backup_database(self):
+        '''Create a backup of the current database'''
+
+        if os.path.isfile(self.db_file):
+            shutil.copyfile(self.db_file, self.db_file+".backup")
+            print "[+] Wrote database backup to '"+str(self.db_file+".backup")+"'"
+        else:
+            print "[-] No current database found, skipping backup"
+
+    def reset_db(self):
+        '''Replaces the current user's database with a new one'''
+
+        if os.path.isfile(self.db_file):
+            print "WARNING: This option will delete the current user's wolpertinger database"
+            print "  in '"+str(DATABASE)+"' and replace it with an empty new database"
+            print "  from '"+str(DATA_DIR_DATABASE)+"'."
+            print "  All portscan results, drone credentials etc. will be deleted!"
+            uinput = raw_input("Enter yes in uppercase letters if you are sure to continue: ")
+            if uinput != 'YES':
+                print "Operation was cancelled."
+                sys.exit(3)
+
+        dbdir = os.path.dirname(self.db_file)
+        if not os.path.exists(dbdir):
+            os.makedirs(dbdir)
+
+        self._backup_database()
+        print "[+] Reseting the database..."
+        shutil.copyfile(DATA_DIR_DATABASE, DATABASE)
+        print "[+] Database reset done."
+        print "    Test the new database and then consider deleting the backup (if any)."
+
+    def _update_to_0_8_3(self):
+        '''Updates the DB layout to version 0.8.3+'''
+
+        print "[+] Altering table 'result'..."
+        self.db_cursor.execute('ALTER TABLE "result" RENAME TO "result_old";')
+        self.db_cursor.execute('''CREATE TABLE "result" (
+    protocol varchar(64) DEFAULT 'TCP',
+    port integer,
+    host_id references host(id),
+    scan_id references scan(id),
+    PRIMARY KEY(protocol, port, host_id, scan_id)
+);''')
+        self.db_cursor.execute('INSERT INTO "result" (port, host_id, scan_id) SELECT port, host_id, scan_id FROM "result_old";')
+        self.db_cursor.execute('DROP TABLE "result_old";')
+
+        print "[+] Altering table 'default_ports'..."
+        self.db_cursor.execute('ALTER TABLE "default_ports" RENAME TO "default_ports_old";')
+        self.db_cursor.execute('''CREATE TABLE "default_ports" (
+    protocol varchar(64) DEFAULT 'TCP',
+	port_string varchar(32)
+);''')
+        self.db_cursor.execute('INSERT INTO "default_ports" (port_string) SELECT port_string FROM "default_ports_old";')
+        self.db_cursor.execute('DROP TABLE "default_ports_old";')
+
+        print "[+] Altering table 'services'..."
+        self.db_cursor.execute('ALTER TABLE "services" RENAME TO "services_old";')
+        self.db_cursor.execute('''CREATE TABLE "services" (
+    name varchar(64),
+    protocol varchar(64) DEFAULT 'TCP',
+    port integer,
+    description varchar(128),
+    PRIMARY KEY(protocol, port)
+);''')
+        self.db_cursor.execute('INSERT INTO "services" (name, port, description) SELECT name, port, description FROM "services_old";')
+        self.db_cursor.execute('DROP TABLE "services_old";')
+
+
+        print "[+] Creating table 'options'..."
+        self.db_cursor.execute('''CREATE TABLE IF NOT EXISTS "options" (
+    key text PRIMARY KEY,
+    value text
+);''')
+        self.db_cursor.execute('INSERT OR REPLACE INTO "options" (key, value) VALUES (\'db_version\', \'0.8.3+\');')
+
+        print "[+] Commiting changes..."
+        self.db_conn.commit()
+
+    def _update_to_0_8_5(self):
+        '''Updates the DB layout to version 0.8.5+'''
+
+        print "[+] Altering table 'scan'..."
+        self.db_cursor.execute('ALTER TABLE "scan" RENAME TO "scan_old";')
+        self.db_cursor.execute('''CREATE TABLE "scan" (
+    id integer primary key autoincrement,
+	tag varchar(64),
+	hosts integer,
+	ports integer,
+	pps integer,
+	source_ip integer,
+	source_port integer,
+	start_time date,
+	end_time date,
+	status varchar(64) DEFAULT 'UNKNOWN'
+);''')
+        self.db_cursor.execute('INSERT INTO "scan" (id, tag, hosts, ports, pps, source_ip, source_port, start_time, end_time) SELECT id, tag, hosts, ports, pps, source_ip, source_port, start_time, end_time FROM "scan_old";')
+        self.db_cursor.execute('DROP TABLE "scan_old";')
+
+        print "[+] Updating table 'options'..."
+        self.db_cursor.execute('UPDATE "options" SET value=\'0.8.5+\' WHERE key=\'db_version\';')
+
+        print "[+] Commiting changes..."
+        self.db_conn.commit()
+
+    def _update_to_0_8_7(self):
+        '''Updates the DB layout to version 0.8.7+'''
+        newports="1-65535"
+        oldports="7,9,11,13,18,19,21-23,25,37,39,42,49,50,53,65,67-70,79-81,88,98,100,105-107,109-111,113,118,119,123,129,135,137-139,143,150,161-164,174,177-179,191,199-202,204,206,209,210,213,220,259-265,345,346,347,369-372,389,406,407,422,427,443-445,487,500,512-515,517,518,520,525,533,538,548,554,563,587,610-612,631-634,636,642,646,653,655,657,666,706,750-752,765,779,808,873,901,923,941,946,992-995,1001,1023-1030,1080,1210,1214,1234,1241,1334,1349,1352,1423-1425,1433,1434,1494,1524,1525,1527,1645,1646,1649,1701,1718,1719,1720,1723,1755,1812,1813,2048-2050,2101-2104,2140,2150,2222,2233,2323,2345,2401,2430,2431,2432,2433,2583,2628,2776,2777,2988,2989,3050,3130,3150,3200,3201,3232,3298-3299,3306,3300,3301,3389,3456,3493,3542-3545,3600,3632,3690,3801,4000,4400,4321,4567,4800,4899,5002,5060,5136-5139,5150,5151,5222,5269,5308,5354,5355,5422-5425,5432,5503,5555,5556,5678,6000-6007,6346,6347,6543,6544,6552,6789,6838,6666-6670,7000-7009,7028,7100,7983,8000,8010,8079-8082,8088,8100,8787,8879,9090,9101-9103,9325,9359,10000,10026,10027,10067,10080,10081,10167,10498,11201,12000,15345,17001-17003,18261-18265,18753,20011,20012,21554,22273,26274,27374,27444,27573,31335-31338,31787,31789,31790,31791,32668,32767-32780,33390,47262,49301,50000-50010,50020,50021,50116,54320,54321,57341,58008,58009,58666,59211,60000,60006,61000,61348,61466,61603,63485,63808,63809,64429,65000,65506,65530-65535"
+
+        print "[+] Checking whether default ports have been changed"
+        self.db_cursor.execute('SELECT group_concat(port_string, \',\') from default_ports;')
+        portsindb=self.db_cursor.fetchone()[0]
+        if oldports==portsindb:
+            print "[+] Updating default ports which were unchanged"
+            self.db_cursor.execute('DELETE FROM default_ports;')
+            for p in newports.split(','):
+                self.db_cursor.execute(ur'INSERT INTO "default_ports" (port_string) VALUES (?);', (p,))
+        else:
+            print "[-] Skipping update of default ports since you changed them manually"
+
+        print "[+] Updating table 'options'..."
+        self.db_cursor.execute('UPDATE "options" SET value=\'0.8.7+\' WHERE key=\'db_version\';')
+
+        print "[+] Commiting changes..."
+        self.db_conn.commit()
+
+    def update_db(self):
+        """Update the database schema"""
+
+        self.open_database(warn_old_version=False) # no need to warn here
+
+        print "[+] Current database schema version is "+str(self.db_version)
+        if self.db_version_or_older(DATABASE_VERSIONS[-2]): # last or older
+            print "    Updating to schema version "+str(DATABASE_VERSIONS[-1])
+            self._backup_database()
+            if self.db_version_or_older("0.7+"): self._update_to_0_8_3()
+            if self.db_version_or_older("0.8.3+"): self._update_to_0_8_5()
+            if self.db_version_or_older("0.8.5+"): self._update_to_0_8_7()
+            print "[+] Update of the database schema was successful."
+            print "    Test the new database and then consider deleting the backup."
+        else:
+            print "    Database schema is up to date."
+
+    ###
+    # USAGE AND MAIN
+    ###
+
+    def usage(self):
+        """Show Wolpertinger MCP usage"""
+
+        print """
+Wolpertinger Master Control Program version __WOLPER_VERSION__
+Usage: wolper-mcp [OPTIONS]
+
+MISC:
+  -l, --list\t\t\tShow list of portscans
+  -f, --find <STRING>\t\tFind a specific portscan
+  -s, --show <SCAN#>\t\tShow detailed information about specified portscan
+  -i, --info\t\t\tShow list of default ports
+  -d, --delete <SCAN#>\t\tDelete scan from database
+  -h, --help\t\t\tPrint this help summary page
+
+MODULES:"""
+
+        for module in self.modules.values():
+            print module.help()
+
+        print """
+SHOW (use with -s|--show):
+  --line-by-line\t\tshow one host and the open ports per line
+
+DATABASE:
+  --reset-db\t\t\tReplaces the current database with an empty one
+  --update-db\t\t\tUpdates the database to the current schema but keeps data
+
+EXAMPLES:
+  wolper-mcp --show 1"""
+
+
+
+    def usage_exit(self, exit_code):
+        """Print help information and exit program"""
+        self.usage()
+        sys.exit(exit_code)
+
+def main():
+    """Main Method"""
+
+    mcp = wolper_mcp()
+
+    # misc options
+    short_options = "ihls:f:d:"
+    long_options = ["info", "help", "list", "show=", "find=",  "delete=", "line-by-line", "reset-db", "update-db"]
+
+    # module options
+    for module in mcp.modules.values():
+        short_options += module.short_option
+        long_options.append(module.long_option)
+
+    # parse command line argument list
+    try:
+        opts = getopt.getopt(sys.argv[1:], short_options, long_options)[0]
+    except getopt.GetoptError:
+        mcp.usage_exit(2)
+    except IndexError:
+        mcp.usage_exit(2)
+
+    if len(opts) == 0:
+        mcp.usage_exit(1)
+
+    # one host per line output
+    if ("--line-by-line", '') in opts:
+        mcp.line_by_line = True
+
+    # check program arguments
+    for o, a in opts:
+        if o in ("-h", "--help"):
+            mcp.usage_exit(0)
+
+        if o in ("-i", "--info"):
+            mcp.show_default_tcp_ports()
+
+        if o in ("-l", "--list"):
+            mcp.list_portscans()
+
+        if o in ("-s", "--show"):
+            try:
+                mcp.show_portscan(int(a))
+            except ValueError:
+                mcp.usage_exit(1)
+
+        if o in ("-f", "--find"):
+            mcp.list_portscans(a)
+
+        if o in ("-d", "--delete"):
+            try:
+                mcp.delete_scan(int(a))
+            except ValueError:
+                mcp.usage_exit(1)
+
+        # check for database options
+        if o in ("--reset-db",):
+            mcp.reset_db()
+
+        if o in ("--update-db",):
+            mcp.update_db()
+
+        # check for module options
+        for module in mcp.modules.values():
+            if o in ("-" + module.short_option.rstrip(':'), "--" + module.long_option.rstrip('=')):
+                module.run(module.parameter(a))
+
+    sys.exit(0)
+
+
+# main
+if __name__ == "__main__":
+    main()

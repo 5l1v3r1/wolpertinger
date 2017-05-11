@@ -37,7 +37,16 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#undef HAVE_CONFIG_H
+#endif
+
+#ifdef HAVE_DUMBNET_H
+#include <dumbnet.h>
+#else
 #include <dnet.h>
+#endif
 
 #include "shared.h"
 #include "ipc.h"
@@ -47,35 +56,19 @@
 /* fixme */
 uint8_t debug;
 
-uint32_t master_socket;
 char my_challenge[MAX_CHALLENGE_LEN];
 extern struct global_informations global;
 
-uint32_t reset_ipc_socket(uint32_t sock)
-{
-	uint32_t cli_sock, cli_size;
-	struct sockaddr_in cli_addr;
-	
-	close(sock); /* Client Socket schließen */
-	
-	cli_size = sizeof(cli_addr);
-	if ((cli_sock = accept(master_socket, (struct sockaddr *) &cli_addr, &cli_size)) < 0) {
-		perror("accept");
-		exit(-1);
-	}	
-	
-	return cli_size;
-}
-
 /*
- * creates a listening socket fpr the drones. normaly uses TCP sockets. if no drones are specified
- * unix domain sockets are used and the drones are spawned by the master process (TODO)
+ * creates a listening socket for the drones. normaly uses TCP sockets. if no drones are specified
+ * unix domain sockets are used and the drones are spawned by the master process
+ * returns listening socket number
  */
 uint32_t open_ipc_socket(uint16_t port, uint8_t type, char *lhost) 
 {
-	uint32_t sock, cli_sock, cli_size, bytes;
+	uint32_t sock;
 	
-	struct sockaddr_in serv_addr, cli_addr;
+	struct sockaddr_in serv_addr;
 	struct sockaddr_un local_addr;
 	
 	/* create socket */
@@ -107,136 +100,181 @@ uint32_t open_ipc_socket(uint16_t port, uint8_t type, char *lhost)
 	/* Socket Bind */
 	if (port == 0) {
 		if (bind(sock, (struct sockaddr *) &local_addr, sizeof(local_addr)) < 0) {
-			perror("bind");	
+			MSG(MSG_ERR, "unix domain socket bind failed: %s\n  socket file: %s\n", strerror(errno), local_addr.sun_path);
+			exit(-1);
+		}
+		if (chmod(local_addr.sun_path, 0777) < 0) {
+			MSG(MSG_ERR, "failed to grand permissions on domain socket: %s\n", strerror(errno));
 			exit(-1);
 		}
 	} else {
 		if (bind(sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
-			perror("bind");	
+			MSG(MSG_ERR, "internet socket bind failed: %s\n", strerror(errno));
 			exit(-1);
 		}
-	}
-		
-	/* Listen... */
-	if (listen(sock,1) < 0) {
-		perror("listen");
-		exit(-1);
 	}
 	
-	if (port == 0) {
-		cli_size = sizeof(local_addr);
-		if((cli_sock = accept(sock, (struct sockaddr*) &local_addr, &cli_size)) < 0) {
-			perror("accept");
-			exit(-1);
-		}
-	} else {
-		cli_size = sizeof(cli_addr);
-		if ((cli_sock = accept(sock, (struct sockaddr *) &cli_addr, &cli_size)) < 0) {
-			perror("accept");
-			exit(-1);
-		}
+	/* Listen... */
+	if (listen(sock,1) < 0) {
+		MSG(MSG_ERR, "socket listen failed: %s\n", strerror(errno));
+		exit(-1);
 	}
 
-	master_socket = sock;
+	return sock;
+}
+
+/*
+ * listens on the socket for the drones and accepts master connecting to it
+ * returns client socket for communication with the master
+ */
+uint32_t listen_ipc_socket(uint32_t prime_sock) 
+{
+	uint32_t cli_sock;
+	
+	if((cli_sock = accept(prime_sock, NULL, NULL)) < 0) {
+		MSG(MSG_ERR, "accept on socket failed: %s\n", strerror(errno));
+		exit(-1);
+	}
+
+	/* master connected. unblocking socket */
+	unblock_socket(cli_sock);
+
+	if (!cli_sock) {
+		MSG(MSG_ERR, "error during connection handling");
+		exit(-1);
+	}
 	
 	return cli_sock;
 }
 
-uint32_t send_ipc_msg(uint32_t sock, char *msg, uint32_t len)
-{
-	int32_t bytes;
+
+void close_ipc_socket(uint32_t sock) {
+	if (close(sock) < 0) {
+		MSG(MSG_WARN, "close client socket failed: %s\n", strerror(errno));
+	}
+}
+
+
+uint32_t send_ipc_msg(uint32_t sock, char *msg, uint32_t len) {
+	int32_t bytes = 0;
 	struct pollfd pfd;
 	struct ipc_message *ipc_m;
+	char *tmp = msg;
 	
-	/* Wait for Socket to get ready to write */
-	pfd.fd=sock;
-	pfd.events=POLLOUT|POLLERR;	
-	pfd.revents=0;
+	uint32_t written = 0;
+	uint32_t nextlen = 0;
+	
+	while ( written < len ) {
+	
+		/* Wait for Socket to get ready to write */
+		pfd.fd=sock;
+		pfd.events=POLLOUT|POLLERR;
+		pfd.revents=0;
 
-	if (poll(&pfd, 1, -1) < 0) {
-		MSG(MSG_WARN, "poll fails: %s", strerror(errno));
-	}		
-				
-	if (pfd.revents & POLLOUT) {	
-		bytes = send(sock, msg, len, 0);
-		if (bytes < 0) {
-		        perror("write");
-		        exit(-1);
+		if (poll(&pfd, 1, -1) < 0) {
+			MSG(MSG_WARN, "poll fails: %s\n", strerror(errno));
+			exit(1);
 		}
-		ipc_m = (struct ipc_message *) msg;
-		MSG(MSG_TRC, "[ipc out] %d bytes (should be: %d bytes) [type: %d]\n", bytes, len, ipc_m->msg_type);
+				
+		if (pfd.revents & POLLOUT) {
+			if (len-written>1024) {
+				nextlen = 1024;
+			} else {
+				nextlen = len-written;
+			}
+			bytes = send(sock, tmp, nextlen, 0);
+			if (bytes < 0) {
+				MSG(MSG_ERR, "send ipc: write failed: %s\n", strerror(errno));
+				exit(1);
+			}
+			written += bytes;
+			tmp += bytes;
+			MSG(MSG_TRC, "[ipc out] wrote %d / %d bytes\n", written, len);
+		}
 	}
-	
-	return bytes;
+	ipc_m = (struct ipc_message *) msg;
+	MSG(MSG_TRC, "[ipc out] %d bytes (should be: %d bytes) [type: %d]\n", bytes, len, ipc_m->msg_type);
+
+	return written;
 }
 
 uint32_t get_ipc_message(uint32_t sock, char **msg)
 {
 	int32_t bytes;
-	fd_set fd_read;
-	uint16_t err;
 	
-	struct timeval waitd;
 	struct ipc_message *ipc_m;
 	
-	char buff[MAX_MSG_LEN];
 	char *msg_buffer = NULL;
 	uint32_t msg_buffer_ptr=0;
-	uint32_t msg_body_len=0;
+	uint32_t nextread=0;
 	
 	struct pollfd pfd;
 	
 	while(1) {
-		waitd.tv_sec = 1;
-		waitd.tv_usec = 0;
-
 		pfd.fd=sock;
-		pfd.events=POLLIN|POLLPRI;	
+		pfd.events=POLLIN|POLLPRI;
 		pfd.revents=0;
 
 		if (poll(&pfd, 1, -1) < 0) {
-			MSG(MSG_WARN, "poll fails: %s", strerror(errno));
+			if (errno == EINTR) continue;
+			MSG(MSG_WARN, "poll fails: %s\n", strerror(errno));
 		}		
 		
 		if (pfd.revents & POLLIN) {
-			bzero(buff, MAX_MSG_LEN);
+			char buff[sizeof(struct ipc_message)+1] = {0};
 
 			// get message header
 			bytes = recv(sock, buff, sizeof(struct ipc_message), 0);
-			if(bytes < 0) {	perror("read"); return 0; } 
+			if(bytes < 0) {
+				MSG(MSG_ERR, "[drone] read failed: %s\n", strerror(errno));
+				return 0;
+			}
 			if (bytes == 0) { /* EOF */
 				MSG(MSG_WARN, "[drone] connection closed by foreign host\n");
 				return 0;
-			}			
-			ipc_m = (struct ipc_message *) buff;
-
-			if (ipc_m->msg_len > MAX_MSG_LEN) {
-				MSG(MSG_WARN, "ipc message to big ( bytes: %d max: %d)\n", ipc_m->msg_len, MAX_MSG_LEN);
+			}
+			if (bytes != sizeof(struct ipc_message)) { /* invalid header len received */
+				// TODO: retry?
+				MSG(MSG_ERR, "[drone] read invalid header len, abort\n");
 				return 0;
 			}
+			ipc_m = (struct ipc_message *) buff;
+
+			/* I atm do not see the reason why we should limit the incoming package size
+			   if we did not limit the outgoing size. */
+			MSG(MSG_DBG, "[drone] reading message of %d bytes\n", ipc_m->msg_len);
 			
 			// fprintf(stderr, "****** message length: %d message type: %d ********\n", ipc_m->msg_len, ipc_m->msg_type);
 			msg_buffer = (char *) safe_zalloc(ipc_m->msg_len);			
-			msg_body_len = ipc_m->msg_len - sizeof(struct ipc_message);
 			msg_buffer_ptr = sizeof(struct ipc_message);
+			//fprintf(stderr, "****** memcpy(size=%d, size=%d, len=%d) ******\n", ipc_m->msg_len, bytes, sizeof(struct ipc_message));
 			memcpy(msg_buffer, buff, sizeof(struct ipc_message));
 			ipc_m = (struct ipc_message *) msg_buffer;
 			
-			bzero(buff, MAX_MSG_LEN);
-			while (msg_body_len && msg_buffer_ptr < ipc_m->msg_len) {
+			char buff2[1024+1] = {0};
+			while (msg_buffer_ptr < ipc_m->msg_len) {
+				// how much to get?
+				nextread = (ipc_m->msg_len - msg_buffer_ptr < 1024)?(ipc_m->msg_len - msg_buffer_ptr):1024;
+				//fprintf(stderr, "****** trying to read at most %d bytes ******\n", nextread);
+
 				// get message body
-				bytes = recv(sock, buff, msg_body_len, 0);
-				if(bytes < 0) {	perror("read"); return 0; } 
+				bytes = recv(sock, buff2, nextread, 0);
+				if(bytes < 0) {
+					if (errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN) continue;
+					MSG(MSG_ERR, "[drone] read failed: %s\n", strerror(errno));
+					return 0;
+				}
 				if (bytes == 0) { /* EOF */
 					MSG(MSG_WARN, "[drone] connection closed by foreign host\n");
 					return 0;
 				}					
-				// fprintf(stderr, "****** got %d more bytes! ********\n", bytes);
-				memcpy(msg_buffer + msg_buffer_ptr, buff, bytes);
-				msg_buffer_ptr = msg_buffer_ptr + bytes;				
+				//fprintf(stderr, "****** got %d more bytes! ********\n", bytes);
+				memcpy(msg_buffer + msg_buffer_ptr, buff2, bytes);
+				msg_buffer_ptr = msg_buffer_ptr + bytes;
+				MSG(MSG_TRC, "[drone] read %d / %d bytes\n", msg_buffer_ptr, ipc_m->msg_len);
 			}
 			*msg = msg_buffer;			    
-			MSG(MSG_DBG, "[ipc in] %d bytes [type: %d]\n", ipc_m->msg_len, ipc_m->msg_type);
+			MSG(MSG_DBG, "[drone] ipc message of %d bytes received [type: %d]\n", ipc_m->msg_len, ipc_m->msg_type);
 			return ipc_m->msg_len;
 		}
 	}
@@ -246,7 +284,7 @@ uint32_t ipc_send_busy(uint32_t sock) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_BUSY;
@@ -254,25 +292,29 @@ uint32_t ipc_send_busy(uint32_t sock) {
 
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
 uint32_t ipc_send_listener_ident(uint32_t sock, uint32_t myaddr) {
 	char *msg;
 	struct ipc_message *ipc_m;
-	
-	msg = (char *)malloc(sizeof(struct ipc_message) + 5);
+
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message) + 8);
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_IDENT_REPLY;
-	ipc_m->msg_len = sizeof(struct ipc_message) + 5;
+	ipc_m->msg_len = sizeof(struct ipc_message) + 8;
 	
 	*(msg + sizeof(struct ipc_message)) = IDENT_LISTENER;
 	
-	*((uint32_t *) (msg + sizeof(struct ipc_message) + 1)) = myaddr;
+	*((uint32_t *) (msg + sizeof(struct ipc_message) + 4)) = myaddr;
 	
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
@@ -280,7 +322,7 @@ uint32_t ipc_send_sender_ident(uint32_t sock) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message) + 1);
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message) + 1);
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_IDENT_REPLY;
@@ -290,6 +332,8 @@ uint32_t ipc_send_sender_ident(uint32_t sock) {
 	
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
@@ -297,7 +341,7 @@ uint32_t ipc_send_ident_request(uint32_t sock) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_IDENT;
@@ -305,6 +349,8 @@ uint32_t ipc_send_ident_request(uint32_t sock) {
 
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
@@ -313,7 +359,7 @@ uint32_t ipc_send_portstate(uint32_t sock, uint16_t port, uint32_t from) {
 	struct ipc_message *ipc_m;
 	struct ipc_portstate *ipc_p;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message) + sizeof(struct ipc_portstate));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message) + sizeof(struct ipc_portstate));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_PORTSTATE;
@@ -336,7 +382,7 @@ uint32_t ipc_send_portstate(uint32_t sock, uint16_t port, uint32_t from) {
  * drone_addr = ip/hostname of drone OR path to unix domain socket
  * port = tcp port to connect to OR 0 for unix domain socket
  */
-uint32_t connect_ipc_socket(char *drone_addr, uint16_t port) {
+uint32_t connect_ipc_socket(const char *drone_addr, uint16_t port) {
 	uint32_t sock;
 	struct sockaddr_in drone;
 	struct sockaddr_un local_drone;
@@ -380,7 +426,7 @@ uint32_t ipc_send_ready(uint32_t sock) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_READY;
@@ -388,6 +434,8 @@ uint32_t ipc_send_ready(uint32_t sock) {
 
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
@@ -395,7 +443,7 @@ uint32_t ipc_send_start(uint32_t sock) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_START;
@@ -403,6 +451,8 @@ uint32_t ipc_send_start(uint32_t sock) {
 
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
@@ -410,7 +460,7 @@ uint32_t ipc_send_error(uint32_t sock, const char *err) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message) + strlen(err));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message) + strlen(err));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_ERROR;
@@ -420,6 +470,8 @@ uint32_t ipc_send_error(uint32_t sock, const char *err) {
 
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
@@ -427,7 +479,7 @@ uint32_t ipc_send_workdone(uint32_t sock) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_WORKDONE;
@@ -435,6 +487,8 @@ uint32_t ipc_send_workdone(uint32_t sock) {
 
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
@@ -442,7 +496,7 @@ uint32_t ipc_send_sender_stats(uint32_t sock, struct ipc_sender_stats *stats) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message) + sizeof(struct ipc_sender_stats));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message) + sizeof(struct ipc_sender_stats));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_SENDER_STATS;
@@ -452,6 +506,8 @@ uint32_t ipc_send_sender_stats(uint32_t sock, struct ipc_sender_stats *stats) {
 	
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
@@ -459,7 +515,7 @@ uint32_t ipc_send_helo(uint32_t sock) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_HELO;
@@ -467,6 +523,8 @@ uint32_t ipc_send_helo(uint32_t sock) {
 
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;	
 }
 
@@ -474,7 +532,7 @@ uint32_t ipc_send_quit(uint32_t sock) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)malloc(sizeof(struct ipc_message));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_QUIT;
@@ -482,6 +540,8 @@ uint32_t ipc_send_quit(uint32_t sock) {
 
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
@@ -489,7 +549,7 @@ uint32_t ipc_send_auth(uint32_t sock, char *auth_str) {
 	char *msg;
 	struct ipc_message *ipc_m;
 	
-	msg = (char *)safe_zalloc(sizeof(struct ipc_message) + strlen(auth_str));
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message) + strlen(auth_str));
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_AUTH;
@@ -520,7 +580,7 @@ uint32_t ipc_send_challenge(uint32_t sock, uint32_t addr, uint8_t *drone_id) {
 	strncpy(my_challenge, challenge, MAX_CHALLENGE_LEN);
 	challenge_len = strlen(challenge);
 
-	msg = (char *)malloc(sizeof(struct ipc_message) + UUID_LEN + challenge_len);
+	msg = (char *) safe_zalloc(sizeof(struct ipc_message) + UUID_LEN + challenge_len);
 	ipc_m = (struct ipc_message *) msg;
 	
 	ipc_m->msg_type = MSG_CHALLENGE;
@@ -532,6 +592,8 @@ uint32_t ipc_send_challenge(uint32_t sock, uint32_t addr, uint8_t *drone_id) {
 	
 	send_ipc_msg(sock, msg, ipc_m->msg_len);
 	
+	free(msg);
+
 	return 0;
 }
 
@@ -548,17 +610,20 @@ bool check_auth(char *msg, char *username, char *password) {
 	memcpy(client_auth, (msg + sizeof(struct ipc_message)), ipc_m->msg_len - sizeof(struct ipc_message));
 		
 	digest = generate_digest(my_challenge, strlen(my_challenge), password, strlen(password));
-	my_auth = (char *)malloc(strlen(digest) + strlen(username) + 1);
+	my_auth = (char *) safe_zalloc(strlen(digest) + strlen(username) + 2);
 
 	sprintf(my_auth, "%s %s", username, digest);
 
 	MSG(MSG_DBG, "[auth] myauth: \"%s\" clientauth: \"%s\"\n", my_auth, client_auth);
 
-	if (strcmp(my_auth, client_auth) == 0) return true;
+	int res = strcmp(my_auth, client_auth);
+
+	free(client_auth);
+	free(my_auth);
+	free(digest);
+
+	if (res == 0) return true;
 	else return false;
 
 }
 
-void ipc_close_socket() {
-	if (master_socket) close(master_socket);
-}

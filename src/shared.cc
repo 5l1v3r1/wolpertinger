@@ -23,13 +23,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/time.h>
-#include <sys/timeb.h>
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/timeb.h>
 #include <stdint.h>
 #include <ctype.h>
 #include <stdarg.h>
@@ -62,9 +58,6 @@
 
 #include "shared.h"
 
-static uint64_t tod_delay=0;
-static uint64_t tod_s_time=0;
-
 static uint64_t sleep_delay=0;
 static uint64_t sleep_s_time=0;
 
@@ -89,7 +82,7 @@ void fatal(const char *format, ...) {
 /*
 Gibt das aktuelle Datum als String zurück
 */
-const char *get_time_str(void) 
+char *get_time_str(void) 
 {
 	time_t 	timep;
 	char	*mytime;
@@ -110,7 +103,7 @@ int create_stream_socket(int proto)
 	int s;
 
 	if((s=socket(AF_INET, SOCK_STREAM, proto))== -1) {
-		perror("socket");
+		MSG(MSG_ERR, "tcp socket call failed: %s\n", strerror(errno));
 		exit(-1);
 	}
 	
@@ -125,7 +118,7 @@ int create_domain_socket(int proto)
 	int s;
 
 	if((s=socket(PF_UNIX, SOCK_STREAM, proto))== -1) {
-		perror("socket");
+		MSG(MSG_ERR, "unix domain socket call failed: %s\n", strerror(errno));
 		exit(-1);
 	}
 	
@@ -174,7 +167,7 @@ int block_socket(int s) {
 /* 
  IP oder Hostnamen in 32 Bit Network-Byte-Order umwandeln
 */
-uint32_t host2long(char *host) {
+uint32_t host2long(const char *host) {
 	struct in_addr addr;
 	struct hostent *he;
 	
@@ -197,12 +190,12 @@ uint32_t host2long(char *host) {
 /*
  * is it a single ip address?
  */
-bool is_ip(char *host)
+bool is_ip(const char *host)
 {
     uint8_t numbers = 0;
     uint8_t dots = 0;
 
-	char *p = host;
+	const char *p = host;
 	
 	while(*p != '\0')
     {
@@ -308,7 +301,7 @@ void *safe_zalloc(int size)
 	return mymem;
 }
 
-/********* HPET-Implementierung ***************************/
+/********* HPET timer (deprecated, not in use) ***************/
 
 static void hpet_event(int val) {
 	hpet_iterations++;
@@ -343,8 +336,8 @@ uint32_t hpet_init_tslot(uint32_t pps, uint32_t fd) {
     struct hpet_info info;
 	uint32_t r;
 
-	sigemptyset(&new_handler.sa_mask);
-    new_handler.sa_flags = 0;
+    sigemptyset(&new_handler.sa_mask);
+    new_handler.sa_flags = SA_RESTART; // restart syscalls after interrupt
     new_handler.sa_handler = hpet_event;
 
     sigaction(SIGIO, NULL, &old_handler);
@@ -356,26 +349,30 @@ uint32_t hpet_init_tslot(uint32_t pps, uint32_t fd) {
 
 	// set frequency
     if (ioctl(fd, HPET_IRQFREQ, pps) < 0) {
-		//perror("HPET_IRQFREQ");
+        //printf("  TODO ERROR ON HPET_IRQFREQ: %s\n", strerror(errno));
+		MSG(MSG_DBG, "HPET_IRQFREQ: %s\n", strerror(errno));
         return 0;
 	}
 
 	// get hpet info
     if (ioctl(fd, HPET_INFO, &info) < 0) {
-		//perror("HPET_INFO");
+        //printf("  TODO ERROR ON HPET_INFO: %s\n", strerror(errno));
+        MSG(MSG_DBG, "HPET_INFO: %s\n", strerror(errno));
 		return 0;
 	}
 
 	// HPET EPI
 	r = ioctl(fd, HPET_EPI, 0);
     if (info.hi_flags && (r < 0)) {
-		//perror("HPET_EPI");
+        //printf("  TODO ERROR ON HPET_EPI: %s\n", strerror(errno));
+        MSG(MSG_DBG, "HPET_EPI: %s\n", strerror(errno));
 		return 0;
 	}
 
 	// Start HPET Timer
     if (ioctl(fd, HPET_IE_ON, 0) < 0) {
-		//perror("HPET_IE_ON");
+        //printf("  TODO ERROR ON HPET_IE_ON: %s\n", strerror(errno));
+        MSG(MSG_DBG, "HPET_IE_ON: %s\n", strerror(errno));
 		return 0;
 	}
 
@@ -385,7 +382,73 @@ uint32_t hpet_init_tslot(uint32_t pps, uint32_t fd) {
 	return 1;
 }
 
-/********* Eigene Billig-Implementierung (Fallback) *******/
+/********* ualarm() based timer implementation (default) *******/
+
+static volatile uint64_t ualarm_iterations=0;
+
+static void ualarm_event(int val) {
+	ualarm_iterations++;
+}
+
+uint64_t ualarm_getiterations() {
+	return ualarm_iterations;
+}
+
+void ualarm_start_tslot(void) {
+	ualarm_iterations=0;
+}
+
+void ualarm_end_tslot(void) {
+    while (ualarm_iterations == 0) {
+	    pause();
+	}
+}
+
+int ualarm_init_tslot(uint32_t pps) {
+    struct sigaction old_handler, new_handler;
+
+    sigemptyset(&new_handler.sa_mask);
+    new_handler.sa_flags = SA_RESTART; // restart syscalls after interrupt
+    new_handler.sa_handler = ualarm_event;
+
+    sigaction(SIGALRM, NULL, &old_handler);
+    sigaction(SIGALRM, &new_handler, NULL);
+
+    uint64_t second = 1000000; /* microseconds */
+    uint64_t ualarm_delay=(second / pps); /* divide */
+
+    // glibc/kernel only allows ualarm value of < 1000000
+    if (ualarm_delay >= second) {
+        ualarm_delay = second - 1;
+    }
+
+    ualarm_iterations=0;
+
+    while (ualarm(ualarm_delay, ualarm_delay) < 0) {
+        if (errno == EINTR) continue;
+        MSG(MSG_DBG, "ualarm: %s\n", strerror(errno));
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/********* poll loop timer implementation (fallback) *******/
+
+static uint64_t get_tod(void) {
+    struct timeval tv;
+    uint64_t tt=0;
+
+    gettimeofday(&tv, NULL);
+
+    tt=tv.tv_sec;
+    /* some 64 bit platforms have massive tv_usecs, truncate them */
+    tt=tt << (4 * 8);
+    tt += (uint32_t)(tv.tv_usec & 0xffffffff);
+
+    return tt;
+}
 
 void sleep_start_tslot(void) {
 	sleep_s_time=get_tod();
@@ -398,7 +461,7 @@ void sleep_end_tslot(void) {
             break;
         }
     }
-    tod_s_time=0;	
+    sleep_s_time=0;	
 }
 
 void sleep_init_tslot(uint32_t pps) {
@@ -428,17 +491,21 @@ const char *getflags(uint8_t flags)
 }
 
 char *md5(char *plaintext, uint16_t len) {
-	EVP_MD_CTX mdctx;
+	EVP_MD_CTX *mdctx;
+	const EVP_MD *md;
 	unsigned char md_value[EVP_MAX_MD_SIZE];
 	char *hash, *p;
 	unsigned int md_len, i;
 
-	EVP_DigestInit(&mdctx, EVP_md5());
-	EVP_DigestUpdate(&mdctx, plaintext, (size_t) len);
-	EVP_DigestFinal_ex(&mdctx, md_value, &md_len);
-	EVP_MD_CTX_cleanup(&mdctx);
+	md = EVP_get_digestbyname("md5");
 
-	hash = (char *)malloc(MD5_ASCII_SIZE);
+	mdctx = EVP_MD_CTX_new();
+	EVP_DigestInit_ex(mdctx, md, NULL);
+	EVP_DigestUpdate(mdctx, plaintext, (size_t) len);
+	EVP_DigestFinal_ex(mdctx, md_value, &md_len);
+	EVP_MD_CTX_free(mdctx);
+
+	hash = (char *) safe_zalloc(MD5_ASCII_SIZE);
     	bzero(hash, MD5_ASCII_SIZE);
 	
 	for(i = 0, p = hash; i < md_len; i++, p += 2)
@@ -448,7 +515,7 @@ char *md5(char *plaintext, uint16_t len) {
 }
 
 char *sha512(char *plaintext, uint16_t len) {
-	EVP_MD_CTX mdctx;
+	EVP_MD_CTX *mdctx;
 	const EVP_MD *md;
 	unsigned char md_value[EVP_MAX_MD_SIZE];
 	char *hash, *p;
@@ -458,24 +525,23 @@ char *sha512(char *plaintext, uint16_t len) {
 
 	md = EVP_get_digestbyname("sha512");
 
-	EVP_MD_CTX_init(&mdctx);
-	EVP_DigestInit_ex(&mdctx, md, NULL);
-	EVP_DigestUpdate(&mdctx, plaintext, len);
-	EVP_DigestFinal_ex(&mdctx, md_value, &md_len);
-	EVP_MD_CTX_cleanup(&mdctx);
+	mdctx = EVP_MD_CTX_new();
+	EVP_DigestInit_ex(mdctx, md, NULL);
+	EVP_DigestUpdate(mdctx, plaintext, len);
+	EVP_DigestFinal_ex(mdctx, md_value, &md_len);
+	EVP_MD_CTX_free(mdctx);
 
-    hash = (char *)safe_zalloc(SHA512_ASCII_SIZE);
+	hash = (char *)safe_zalloc(SHA512_ASCII_SIZE);
 
 	for(i = 0, p = hash; i < md_len; i++, p += 2)
 		sprintf(p, "%02x", md_value[i]);
 
-    return hash;
-
+	return hash;
 }
 
 char *generate_digest(char *text, uint32_t text_len, char *key, uint32_t key_len)
 {
-	EVP_MD_CTX context;
+	EVP_MD_CTX *context, *tctx;
 	unsigned char k_ipad[65];
 	unsigned char k_opad[65];
 	unsigned char tk[16];
@@ -483,14 +549,14 @@ char *generate_digest(char *text, uint32_t text_len, char *key, uint32_t key_len
 	unsigned int md_len, i;
 	char *hash, *p;
 	
-	digest = (unsigned char *) malloc(16);
+	digest = (unsigned char *) safe_zalloc(16);
 	
-	if (key_len > 64) {
-		EVP_MD_CTX tctx;
-
-		EVP_DigestInit(&tctx, EVP_md5());
-		EVP_DigestUpdate(&tctx, key, key_len);
-		EVP_DigestFinal_ex(&tctx, tk, &md_len);
+	if (key_len > 64) {        
+        tctx = EVP_MD_CTX_create();
+		EVP_DigestInit(tctx, EVP_md5());
+		EVP_DigestUpdate(tctx, key, key_len);
+		EVP_DigestFinal_ex(tctx, tk, &md_len);
+        EVP_MD_CTX_destroy(tctx);
 		
 		key = (char *) tk;
 		key_len = 16;
@@ -506,55 +572,60 @@ char *generate_digest(char *text, uint32_t text_len, char *key, uint32_t key_len
 		k_opad[i] ^= 0x5c;
 	}
 	
-	EVP_DigestInit(&context, EVP_md5());
-	EVP_DigestUpdate(&context, k_ipad, 64);
-	EVP_DigestUpdate(&context, text, text_len);
-	EVP_DigestFinal_ex(&context, digest, &md_len);
+    context = EVP_MD_CTX_create();
+	EVP_DigestInit(context, EVP_md5());
+	EVP_DigestUpdate(context, k_ipad, 64);
+	EVP_DigestUpdate(context, text, text_len);
+	EVP_DigestFinal_ex(context, digest, &md_len);
+    EVP_MD_CTX_destroy(context);
 	
-	EVP_DigestInit(&context, EVP_md5());
-	EVP_DigestUpdate(&context, k_opad, 64);
-	EVP_DigestUpdate(&context, digest, 16);
-	EVP_DigestFinal_ex(&context, digest, &md_len);	
+    context = EVP_MD_CTX_create();
+	EVP_DigestInit(context, EVP_md5());
+	EVP_DigestUpdate(context, k_opad, 64);
+	EVP_DigestUpdate(context, digest, 16);
+	EVP_DigestFinal_ex(context, digest, &md_len);
+    EVP_MD_CTX_destroy(context);
 	
-	hash = (char *)malloc(MD5_ASCII_SIZE);
-    bzero(hash, MD5_ASCII_SIZE);	
+	hash = (char *) safe_zalloc(MD5_ASCII_SIZE);
 	
 	for(i = 0, p = hash; i < md_len; i++, p += 2)
 		sprintf(p, "%02x", digest[i]);	
 	
+    free(digest);
+
 	return hash;
 }
 
-char *get_scan_duration(struct timeb *start, struct timeb *stop) {
-	uint32_t hours, minutes, seconds, milliseconds;				// time variables
-	uint32_t time_delta_sec, time_delta_msec;
-	uint32_t tt_start, tt_stop;	
+char *get_scan_duration(mytime_t start, mytime_t stop) {
+	mytime_t hours, minutes, seconds; //, milliseconds;			// time variables
+	mytime_t time_delta_sec; //, time_delta_msec;
 	
-	tt_start = start->time * 1000;
-	tt_start += start->millitm;
+    //printf("start time: %u\n", start);
+	//tt_start += start->millitm;
 	
-	tt_stop = stop->time * 1000;
-	tt_stop += stop->millitm;	
+    //printf("stop time: %u\n", stop);
+	//tt_stop += stop->millitm;	
 	
-	char *duration = (char *)calloc(1, 64);						// duration string
+	char *duration = (char *) safe_zalloc(512);						// duration string
 	
 	/* difference in milliseconds */
-	time_delta_msec = tt_stop - tt_start;
+	//time_delta_msec = tt_stop - tt_start;
 	
 	/* difference in seconds */
-	time_delta_sec = time_delta_msec / 1000;
+	time_delta_sec = stop - start;
+    //printf("delta: %u\n", time_delta_sec);
 	
-	hours = time_delta_sec / 3600;
-	minutes = (time_delta_sec - (hours * 3600)) / 60; 
-	seconds = time_delta_sec - (hours * 3600) - (minutes * 60);
-	milliseconds = (time_delta_msec - ((hours * 3600) * 1000) - ((minutes * 60) * 1000) - (seconds * 1000));
+	hours = time_delta_sec / 3600LLU;
+	minutes = (time_delta_sec - (hours * 3600LLU)) / 60LLU;
+	seconds = time_delta_sec - (hours * 3600LLU) - (minutes * 60LLU);
+	//milliseconds = (time_delta_msec - ((hours * 3600) * 1000) - ((minutes * 60) * 1000) - (seconds * 1000));
 	
 	if (hours > 0) 
-		sprintf(duration, "%uh%um%u.%03us\n", hours, minutes, seconds, milliseconds);	
+		sprintf(duration, "%juh%jum%jus\n", hours, minutes, seconds);	
 	else if (minutes > 0)
-		sprintf(duration, "%um%u.%03us\n", minutes, seconds, milliseconds);	
+		sprintf(duration, "%jum%jus\n", minutes, seconds);	
 	else 
-		sprintf(duration, "%u.%03u seconds\n", seconds, milliseconds);
+		sprintf(duration, "%ju seconds\n", seconds);
 		
 	return duration;
 }
@@ -566,38 +637,32 @@ uint8_t file_copy(char *src, char *dst)
 
   /* open source file */
   if((from = fopen(src, "rb"))==NULL) {
-    fprintf(stderr, "[err] cannot open file : %s\n", src);
-    exit(1);
+    MSG(MSG_ERR, "cannot open file '%s': %s\n", src, strerror(errno));
   }
 
   /* open destination file */
   if((to = fopen(dst, "wb"))==NULL) {
-    fprintf(stderr, "[err] cannot open file : %s\n", dst);
-    exit(1);
+    MSG(MSG_ERR, "cannot open file '%s': %s\n", dst, strerror(errno));
   }
 
   /* copy the file */
   while(!feof(from)) {
     ch = fgetc(from);
     if(ferror(from)) {
-      fprintf(stderr, "[err] error reading file : %s\n", src);
-      exit(1);
+      MSG(MSG_ERR, "error reading file '%s'\n", src);
     }
     if(!feof(from)) fputc(ch, to);
     if(ferror(to)) {
-      fprintf(stderr, "[err] error writing file : %s\n", dst);
-      exit(1);
+      MSG(MSG_ERR, "error writing file '%s'\n", dst);
     }
   }
 
   if(fclose(from)==EOF) {
-    fprintf(stderr, "[err] error closing file : %s\n", src);
-    exit(1);
+    MSG(MSG_ERR, "error closing file '%s': %s\n", src, strerror(errno));
   }
 
   if(fclose(to)==EOF) {
-    fprintf(stderr, "[err] error closing file : %s\n", dst);
-    exit(1);
+    MSG(MSG_ERR, "error closing file '%s': %s\n", dst, strerror(errno));
   }
 
   return 0;
@@ -646,6 +711,7 @@ uint16_t in_cksum(uint16_t *ptr, uint32_t nbytes) {
 }
 
 /* output */
+#ifndef NOMAINFUNCTION
 void _display(int type, const char *file, int lineno, const char *fmt, ...) 
 {
 	char buf[MAX_OUTPUT_LEN];
@@ -660,7 +726,7 @@ void _display(int type, const char *file, int lineno, const char *fmt, ...)
 			
 		case MSG_ERR:
 			fprintf(stderr, "[Error   %s:%d] %s", file, lineno, buf);
-			exit(0);
+			exit(1);
 			break;
 
 		case MSG_DBG:
@@ -677,23 +743,25 @@ void _display(int type, const char *file, int lineno, const char *fmt, ...)
 	/* syslog output */
 	if (global.syslog) {
 		switch (type) {
+			case MSG_VBS:
 			case MSG_USR:
 				syslog(LOG_INFO, "%s", buf);
 				break;
 
 			case MSG_WARN:
-				syslog(LOG_INFO, "%s", buf);
+				syslog(LOG_WARNING, "%s", buf);
 				break;
 
 			case MSG_ERR:
 				syslog(LOG_ERR, "%s", buf);
-				break;				
+				break;
 		}
 	}
 	
 
 	return;
 }
+#endif
 
 int drop_priv(void)
 {
@@ -736,5 +804,35 @@ void cls(void) {
 	/* clear screen */
 	printf("\033[2J");
 
+	return;
+}
+
+
+
+void get_userpass_from_file(FILE *fd, char *username, char *password)
+{
+	char *current = username;
+
+	uint32_t index = 0;
+	int32_t ch;
+	
+	while((ch = getc(fd)) != EOF) {
+		if (ch == ':' || ch == '\r' || ch == '\n' || ch == '\t' || ch == '\0') {
+			if (index == 0) continue;
+			current[index] = '\0';
+			if (current == password) break;
+			current = password;
+			index = 0;
+		} else if (index < MAX_USERNAME_LEN -1 && index < MAX_PASSWORD_LEN -1) {
+			current[index++] = (char) ch;
+		} else {
+			MSG(MSG_ERR, "One of the specifications from your input file is too long (> %d chars)\n", (int) sizeof(current));
+		}
+	}
+	
+	if (index > 0) {
+		current[index] = '\0';
+	}
+	
 	return;
 }

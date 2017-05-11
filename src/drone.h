@@ -23,10 +23,6 @@
 
 #define MAX_PORT_STR_LEN 5
 
-#define MAX_TARGETS			1024								// maximum number of targets in target string
-#define MAX_PORTS			1024								// maximum number of ports in port string
-#define MAX_DRONES			32									// maximum number of drones
-
 #define ERR_CONNECTION_CLOSED 1
 #define ERR_WRONG_TYPE 2
 #define ERR_AUTH_FAILED 3
@@ -37,6 +33,7 @@
 #define ERR_NO_TARGETLIST 8
 
 #include <vector>
+#include <string.h>
 
 using namespace std;
 
@@ -103,8 +100,10 @@ class drone {
 		drone(); 
 		drone(uint32_t addr);
 		drone(uint32_t addr, uint16_t port);
-		drone(uint32_t addr, uint16_t port, char *pass);
-		~drone(); // fehlermeldung, free()
+		drone(uint32_t addr, uint16_t port, const char *pass);
+        drone( const drone& other );
+		~drone();
+        drone& operator=(const drone& other);
 
 		/* set properties */
 		void add_host_workunit(struct targets *tt);
@@ -114,16 +113,17 @@ class drone {
 		void set_listener_addr(uint32_t addr) { listener_addr = addr; }
 		void set_port(uint16_t port) { my_port = port; }
 		void set_type(uint8_t type) { my_type = type; }
-		void set_pass(char *pass) { my_pass = pass; }
+		//void set_pass(char *pass) { my_pass = pass; }
+        char *get_pass(void) { return my_pass; }
 		void set_debug(void) { debug = true; }
 		void set_tcpops(uint32_t tcpops) { scan_tcpops = tcpops; }
 		void set_retry(uint32_t retry_num) { scan_retry = retry_num; }
 		void set_stats(struct ipc_sender_stats *stats) { memcpy(&my_stats, stats, sizeof(struct ipc_sender_stats)); }
 
-		uint32_t set_timeout(uint32_t seconds) { scan_timeout = seconds; }
-		uint32_t set_pps(uint32_t pps) { scan_pps = pps; }
-		uint32_t set_sport(uint16_t sport) { scan_sport = sport; }
-		uint32_t set_secret(uint32_t secret) { scan_secret = secret; }
+		void set_timeout(uint32_t seconds) { scan_timeout = seconds; }
+		void set_pps(uint32_t pps) { scan_pps = pps; }
+		void set_sport(uint16_t sport) { scan_sport = sport; }
+		void set_secret(uint32_t secret) { scan_secret = secret; }
 		
 		
 		/* get properties */
@@ -140,10 +140,9 @@ class drone {
 		uint8_t get_type(void) { return my_type; }	
 		
 		/* methods */
-		uint32_t connect(void);
+		uint32_t connect_and_authenticate(bool configmode);
 		uint32_t send_workload(void);
 		uint32_t send_new_workload(void); /* target re-distribution */
-		uint32_t authenticate(void);
 		uint32_t init(void);
 		uint32_t start(void);
 		uint32_t stop(void);
@@ -175,21 +174,22 @@ class drone_list {
 		bool debug;
 		bool verb;
 		bool local;
+		
+		/* interface for locally forked drones to listen/send on */
+		char *iface;
 
 		/* saved commandline string (for database entry) */
 		char *scan_cmd_line;
 		
 		/* Target Array */
-		struct targets target_buffer[MAX_TARGETS];
+		vector<struct targets> target_buffer;
 		uint32_t target_buffer_count;
 
 		/* Port Array */
-		struct ports port_buffer[MAX_PORTS];
-		uint32_t port_buffer_count;
+		vector<struct ports> port_buffer;
 
 		/* Target Distribution Array */
-		uint16_t drone_distribution[MAX_DRONES][MAX_TARGETS];
-		uint16_t drone_distribution_idx[MAX_TARGETS];
+		vector<vector<uint16_t> > drone_distribution; // for every Drone-ID a list of Target-IDs
 		
 		void create_send_workunit(void);
 		void create_listen_workunit(void);
@@ -202,23 +202,25 @@ class drone_list {
 		~drone_list();
 		
 		/* set properties */
-		void add_dronestr(char *dronestr);
-		uint32_t add_drone(uint32_t addr, uint16_t port, char *pass);
+		void add_dronestr(const char *dronestr);
+		uint32_t add_drone(uint32_t addr, uint16_t port, const char *pass);
 		uint32_t add_hostexp (char *hostexp);
-		uint32_t add_portstr(char *portstr);
+		uint32_t add_portstr(const char *portstr);
 
 		void set_portstate (char *msg);
 		void statistics(char *msg, uint32_t drone_index);
 		void set_tcpops(uint32_t tcpops) { scan_tcpops = tcpops; }
 		void set_retry(uint32_t retry_num) { scan_retry = retry_num; }
-		uint32_t set_timeout(uint32_t seconds) { scan_timeout = seconds; }
-		uint32_t set_pps(uint32_t pps) { scan_pps = pps; }
-		uint32_t set_sport(uint16_t sport) { scan_sport = sport; }		
+		void set_timeout(uint32_t seconds) { scan_timeout = seconds; }
+		void set_pps(uint32_t pps) { scan_pps = pps; }
+		void set_sport(uint16_t sport) { scan_sport = sport; }		
 
 		void set_debug(void) { debug = true; }
 		void set_verb(void) { verb = true; }
 		void set_local(void) { local = true; }
 		void save_cmd_line(int argc, char *argv[]);
+		
+		void set_interface(char *ifname) { iface = strdup(ifname); }
 		
 		/* get properties */
 		uint32_t get_num_listener_drones(void) { return num_listen_drones; }
@@ -237,15 +239,16 @@ class drone_list {
 		bool get_local(void) { return local; }
 
 		/* methods */
-		uint32_t connect(void);
-		uint32_t authenticate(void);
+		uint32_t connect_and_authenticate(void);
+        uint32_t connect_and_authenticate(bool configmode);
 		void balance_workunit(void);
 		uint32_t distribute_workunits(void);
 		uint32_t start_scan(void);
 		uint32_t stop_scan(void);
 		void remove_drone(uint32_t index, const char *msg);
 		
-		uint32_t poll_drones(void);		
+		uint32_t poll_drones(void);
+		void quit_all_drones();
 };
 
 #endif

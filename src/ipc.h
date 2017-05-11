@@ -42,7 +42,6 @@
 #define MAX_CHALLENGE_LEN 128
 #define MAX_DIRNAME_LEN 256
 
-#define MAX_MSG_LEN 8192
 #define MAX_BUFFER_LEN 1048576 		// 1 MB
 
 #define STATE_WAIT_FOR_WORK 1
@@ -71,8 +70,8 @@ struct ipc_sendunit {
 		uint32_t secret;
 		uint32_t retry;
 		uint32_t tcpops;
-        uint16_t port_data_len;
-        uint16_t ip_data_len;
+        uint32_t port_data_len;
+        uint32_t ip_data_len;
         uint16_t sport;
 		uint16_t send_stats;
 };
@@ -154,9 +153,11 @@ class ipc {
 		void set_debug(uint8_t debug_lvl) { debug = debug_lvl; }
 };
 
-uint32_t reset_ipc_socket(uint32_t sock);
 uint32_t open_ipc_socket(uint16_t port, uint8_t type, char *lhost);
-uint32_t connect_ipc_socket(char *drone_addr, uint16_t port);
+uint32_t listen_ipc_socket(uint32_t prime_sock);
+uint32_t connect_ipc_socket(const char *drone_addr, uint16_t port);
+void close_ipc_socket(uint32_t sock);
+
 bool check_auth(char *msg, char *username, char *password);
 
 uint32_t get_ipc_message(uint32_t sock, char **msg);
@@ -176,7 +177,5 @@ uint32_t ipc_send_challenge(uint32_t sock, uint32_t addr, uint8_t *drone_id);
 uint32_t ipc_send_helo(uint32_t sock);
 uint32_t ipc_send_auth(uint32_t sock, char *auth_str);
 uint32_t ipc_send_sender_stats(uint32_t sock, struct ipc_sender_stats *stats);
-
-void ipc_close_socket();
 
 #endif

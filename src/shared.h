@@ -21,6 +21,11 @@
 #ifndef SHARED_H
 #define SHARED_H
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#undef HAVE_CONFIG_H
+#endif
+
 #define MAX_IP_STR_LEN 16
 #define MD5_ASCII_SIZE 33 /* 32bit + \0 */
 #define SHA512_ASCII_SIZE 129
@@ -33,14 +38,18 @@
 #define DEFAULT_PASS "kladderadatsch"
 
 #define MAX_HOSTNAME_LEN	256
+#define MAX_PORTSTRING_LEN	(65535*6)
 #define MAX_LOG_TYPE_NUM 	2
 #define UUID_LEN 16
 #define UUID_STR_LEN 33
 
 #define PATH_DRONE PREFIX_DIR "/bin/wolperdrone"
 
-#define MY_NAME "wolpertinger"
-#define MY_VERSION "0.6"
+#define PATH_CONFIG SYSCONFDIR "/wolper.conf"
+#define PATH_SECRET SYSCONFDIR "/wolper.secret"
+
+#define MY_NAME PACKAGE_NAME
+#define MY_VERSION PACKAGE_VERSION
 
 #define CHLD_SYNC_TIMEOUT 5000000 /* 5 seconds */
 
@@ -52,6 +61,7 @@
     output=(secret) ^ ( (srcip) ^ ( ( (srcport) << 16) + (dstport) ) )
 
 #define tsc_t uint64_t
+typedef uint64_t mytime_t;
 
 #include <pcap.h>
 
@@ -101,30 +111,16 @@ struct info {
 	char *scan_tag;
 };
 
-static uint64_t get_tod(void) {
-    struct timeval tv;
-    uint64_t tt=0;
-
-    gettimeofday(&tv, NULL);
-
-    tt=tv.tv_sec;
-    /* some 64 bit platforms have massive tv_usecs, truncate them */
-    tt=tt << (4 * 8);
-    tt += (uint32_t)(tv.tv_usec & 0xffffffff);
-
-    return tt;
-}
-
 void fatal(const char *format, ...);
-const char *get_time_str(void);
+char *get_time_str(void);
 int unblock_socket(int s);
 int block_socket(int s);
 int create_stream_socket(int proto) ;
 int create_raw_socket(int proto);
 int create_domain_socket(int proto);
 uint16_t in_cksum(uint16_t *ptr, uint32_t nbytes);
-uint32_t host2long(char *host);
-bool is_ip(char *host);
+uint32_t host2long(const char *host);
+bool is_ip(const char *host);
 bool is_ip_cidr(char *host);
 bool is_ip_range(char *host);
 void *safe_zalloc(int size);
@@ -133,11 +129,15 @@ uint16_t get_rnd_uint16(void);
 uint32_t get_rnd_uint32(void);
 unsigned int get_rnd_uint(void);
 
+void ualarm_start_tslot(void);
+void ualarm_end_tslot(void);
+int ualarm_init_tslot(uint32_t pps);
+uint64_t ualarm_getiterations(void);
+
 void sleep_init_tslot(uint32_t pps);
 void sleep_start_tslot(void);
 void sleep_end_tslot(void);
 
-static void hpet_event(int val);
 void hpet_start_tslot(void);
 void hpet_end_tslot(void);
 uint32_t hpet_init_tslot(uint32_t pps, uint32_t fd);
@@ -148,7 +148,7 @@ char *md5(char *plaintext, uint16_t len);
 char *sha512(char *plaintext, uint16_t len);
 char *generate_digest(char *text, uint32_t text_len, char *key, uint32_t key_len);
 
-char *get_scan_duration(struct timeb *start, struct timeb *stop);
+char *get_scan_duration(mytime_t start, mytime_t stop);
 uint8_t file_copy(char *src, char *dst);
 unsigned long int tv2long(struct timeval *tv);
 
@@ -158,5 +158,7 @@ int drop_priv(void);
 void gotoxy(int x, int y);
 void reset_cursor(void);
 void cls(void);
+
+void get_userpass_from_file(FILE *fd, char *username, char *password);
 
 #endif

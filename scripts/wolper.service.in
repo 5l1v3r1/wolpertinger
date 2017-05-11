@@ -1,0 +1,12 @@
+[Unit]
+Description=Default Drones for Wolpertinger Portscanner
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=__WOLPER_BIN_DIR__/wolperctl start
+ExecStop=__WOLPER_BIN_DIR__/wolperctl stop
+Restart=on-abort
+
+[Install]
+WantedBy=multi-user.target

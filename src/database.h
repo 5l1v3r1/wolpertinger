@@ -31,26 +31,20 @@
 #define MAX_STRING_LEN			256
 #define MAX_DEFAULT_PORTSTR_LEN	4096
 
-static sqlite3 *db;											// SQLite Datenbank
-static uint32_t scan_id;									// Portscan ID
-static char default_port_string[MAX_DEFAULT_PORTSTR_LEN];	// default port string
-static char *pport_string = default_port_string;			// pointer to default_port_string
-static char **credentials;									// drone credentials
-
-static int callback(void *NotUsed, int argc, char **argv, char **azColName);
-
 int db_open(void);
+int db_find_version(void);
 int db_exec(char *sql_stmt);
-void db_close(void);
+int db_close(void);
 
-int db_create_scan(struct timeb *time, struct info *scan_info);
+int db_create_scan(mytime_t starttime, mytime_t estendtime, struct info *scan_info);
 int db_set_listener(uint32_t ip);
-int db_finish_scan(struct timeb *time);
+int db_cancel_scan(mytime_t time);
+int db_finish_scan(mytime_t time);
 int db_add_drone(uint32_t ip, uint16_t port, uint32_t type);
 int db_add_drone_credentials(uint8_t *uuid, char *username, char *password);
 char **db_get_drone_credentials(uint8_t *uuid);
-int db_store_result(uint32_t ip, uint16_t port);
-char *db_get_default_ports(void);
+int db_store_tcp_result(uint32_t ip, uint16_t port);
+char *db_get_default_tcp_ports(void);
 char *db_create_report(uint32_t scan_id);
 char *db_set_savepoint(void);
 char *db_rollback(void);

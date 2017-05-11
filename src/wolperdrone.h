@@ -41,8 +41,8 @@ class wolperdrone {
 		uint32_t timeout;	
 			
 		uint16_t port;
-		uint16_t client_sock;
-		uint16_t sock;
+		uint32_t prime_sock;
+		uint32_t client_sock;
 		uint16_t sport;
 		uint16_t datalink_offset;
 
@@ -64,7 +64,8 @@ class wolperdrone {
 		
 		pcap_t *pcap; /* pcap handle */			
 		ip_t *ip_handle; /* ip handle (libdnet) */
-		uint32_t hpet_handle; /* hpet file handle */
+
+		pid_t notifypid; /* PID to signal when started, single mode only */
 
 		/* privat methods */
 		uint32_t get_device_addr(void);
@@ -76,7 +77,9 @@ class wolperdrone {
 		
 		void randomize_portlist(void);
 		void randomize_hostlist(void);
-		void send_packets(ip_t *ip_handle);
+
+        void arpscan(void);
+		void send_packets(void);
 	public:
 		/* constructor / destructor */
 		wolperdrone();
@@ -84,6 +87,7 @@ class wolperdrone {
 		
 		void parse_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
 		void init_options(int argc, char *argv[]);
+		void rootsetup(void);
 		void listen(void);
 		void ipc_loop(void);
 		void cleanup(void);
@@ -105,4 +109,5 @@ struct pseudo_header {
 void help(char *me);
 void handle_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
 
+void get_userpass_from_file(FILE *fd, char *username, char *password);
 #endif

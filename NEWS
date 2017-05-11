@@ -1,0 +1,8 @@
+2012-07-06 Version 0.8.0 is done, fixing some bugs
+2012-11-20 Version 0.8.1 is done, some more minor bugs fixed
+2013-02-15 Version 0.8.2 is done, with some more bug fixes
+2013-05-08 Version 0.8.3 is done, allowing UDP in the database schema
+2013-08-05 Version 0.8.4 is done, with more fixes and some deamon features
+2014-05-21 Version 0.8.5 is done, various ipc fixes
+2015-06-19 Version 0.8.6 is done, introducing better permission handling
+2017-04-20 Version 0.8.7 is done, fixing arp and strange use cases

@@ -1,12 +1,88 @@
+2017-04-20 Finn Steglich <git@finn-steglich.de>
+    * version: 0.8.7
+    * merged testing and stable gits, version numbers are dynamic now
+    * wolpertinger will now skip hosts for which the first port did not get an arp reply
+    * changed timing method to not use HPET anymore, because its sloppier than my workaround
+    * wolpertinger now reads default drones from config file
+    * fixed these strange issues that people hat with scanning only 1 pps or scanning without active interfaces, what do these hackers do all day?
+    * fixed some issues and memory leaks
+
+2015-06-19 Finn Steglich <git@finn-steglich.de>
+    * version: 0.8.6
+    * all file reads now ignore missing newline at the end
+    * unnesasary header dependency stropts.h removed
+    * wolperctl now writes wolper.conf if not exists
+    * wolperdrone now drops privileges before first connection from master
+    * added method for wolpertinger to aquire root permissions via sudo in local mode
+    * finished all manpages
+    * added systemd service file for wolperctl
+    * ignoring reinsert of duplicate ports (mostly relevant for retry option)
+    * sender statistics changed so that retries multiply with the total packets
+    * special characters output does not depend on pipe anymore
+    * removed ipc max len in reading
+    * writing and reading ipc message chunked and retry
+    * changed default installation prefix to /usr and default sysconfir to /etc
+    * fixed invalid write in get_ipc_message due to stacked messages
+
+2014-05-21 Finn Steglich <git@finn-steglich.de>
+    * version: 0.8.5
+    * various debug and warning messages added
+    * added seperate way for drones to find interface address
+    * added interface option for wolpertinger in local mode
+    * fixed unique column inserts to ignore errors on db level
+    * better support for end times, displays and stores scan states
+    * added multiple authentication methods for drones to be executed one by one
+    * various fixes, memfrees, secure allocs and variations in ipc communication
+
+2013-08-05 Finn Steglich <git@finn-steglich.de>
+    * version: 0.8.4
+    * fixed interruped ip_send call with retrying attempts
+    * wolperdrone support for username/password instead of interactive use
+    * added wolperctl script to start/stop drones, modified init-script
+    * deamon mode of wolperdrone revised
+    * added and extended man pages
+
+2013-05-08 Finn Steglich <git@finn-steglich.de>
+    * version: 0.8.3
+    * configure fixed in some rare cases
+    * changed database schema to also support UDP ports, including migration routines and reset functions
+    * SQL input is now sanatized in all functions
+    * some fixes regarding database creation
+
+2013-02-15 Finn Steglich <git@finn-steglich.de>
+    * version: 0.8.2
+    * Some fixed limits modified, this should fix some buffer overflows
+    * portlists can now be given to wolpertinger via a file
+    * Some fixes on the estimated time forecast and time formats
+    * added one more fallback for timeslot messurements (PPS) based on ualarm
+    * resolved some warnings (mostly unused parts of code)
+
+2012-11-20 Finn Steglich <git@finn-steglich.de>
+    * version: 0.8.1
+    * libdumbnet: libdumbnet is now recognized as Debians replacement for libdnet
+    * ip sorting: wolper-mcp should now sort ips as they should be
+    * localdir: and now even the right localdir for unix sockets is created
+
+2012-07-06 Finn Steglich <git@finn-steglich.de>
+    * version: 0.8.0
+    * deleting scans with wolper-mcp.py: no ports or no drones is no failure anymore
+    * ip-count: corrected calculation of ips
+    * input validation: partial ips will not be accepted anymore
+    * ranges from zero: ip ranges that start with zero are accepted now
+    * local mode: master should now wait for drones binding local unix sockets correctly
+    * python2: configure will search for python2 and update all scripts to its path
+    * dependencies: configure will now check for dependent librarys
+    * localdir: localdir for unix sockets has a dummy file now to be created even with dpkg
+
 2010-07-21  Christian Eichelmann <ceichelmann@gmx.de>
-	* version: 0.6
-	* hpet: added HPET support for more precise timing
-	* statistics: added sender statistics (activate with -v)
-	* drop privileges: wolperdrone drops privileges to nobody after creating pcap filter and dnet handle
-	* no database: use -q switch to avoid the scan being saved in the database
+    * version: 0.6
+    * hpet: added HPET support for more precise timing
+    * statistics: added sender statistics (activate with -v)
+    * drop privileges: wolperdrone drops privileges to nobody after creating pcap filter and dnet handle
+    * no database: use -q switch to avoid the scan being saved in the database
 
 2009-06-03  Christian Eichelmann <ceichelmann@gmx.de>
-	* wolpertinger: Release Candidate 1
+    * wolpertinger: Release Candidate 1
 
-2009-06-02	Christian Eichelmann <ceichelmann@gmx.de>
-	* main-send.cc: libdnet is used for sending packets
+2009-06-02    Christian Eichelmann <ceichelmann@gmx.de>
+    * main-send.cc: libdnet is used for sending packets

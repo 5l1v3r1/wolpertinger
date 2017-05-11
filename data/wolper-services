@@ -5064,8 +5064,8 @@ entextmed	12003/tcp  IBM Enterprise Extender SNA COS Medium Priority
 entextlow	12004/tcp  IBM Enterprise Extender SNA COS Low Priority
 dbisamserver1   12005/tcp  DBISAM Database Server - Regular
 dbisamserver2   12006/tcp  DBISAM Database Server - Admin
-accuracer       12007/tcp  Accuracer Database System ñ Server
-accuracer-dbms  12008/tcp  Accuracer Database System ñ Admin
+accuracer       12007/tcp  Accuracer Database System Server
+accuracer-dbms  12008/tcp  Accuracer Database System Admin
 edbsrvr         12010/tcp  ElevateDB Server
 vipera          12012/tcp  Vipera Messaging Service
 vipera-ssl      12013/tcp  Vipera Messaging Service over SSL Communication

@@ -1,0 +1,35 @@
+
+wolpertinger is a distributed portscanner.
+
+See INSTALL for dependencies, build and installation advice.
+
+See the manpages in docs for options and examples on how to use wolpertinger.
+
+
+# Components
+
+## wolpertinger
+
+The wolpertinger is a portscanner designed to do portscans from multiple hosts. It uses inter-process communication over TCP (or unix domain sockets when using only one host) to synchronize the three parts of the scanner: the sender, the listener and the master. Multiple sender-processes (send drones) can be used to speed up the portscan. The workunits are distributed by a round-robin algorithm, trying to get each sender drone the same number of probe-packets to send. All send drones are spoofing the source adress of the host where the listener-process is located. The listener-process (listener drone) is waiting for the responses of the scan. By using a TCP hashtracking algorithm, the listener drone can decide whether the packet belongs to a the portscan or not. Once an open port is found the listener drone report it to the master process. With this mechanism it is possible to use the bandwih of multiple hosts with as little overhead for IPC as possible.
+
+
+## wolperdrone
+
+The wolperdrone is the actual portscanner component. It gets jobs from the wolpertinger command via a TCP or a Unix socket and does it work.
+
+If the drone is a listener (call with -L) it will listen on the interface specified for incoming portscan replies to wolpertinger SYN pakets and will tell the master (i.e. the wolpertinger programm) about those open ports.
+
+If called as sender (with -S) the drone will send TCP-SYN-pakets as specified by the master (i.e. the wolpertinger programm) to hosts and ports as it fits.
+
+
+## wolper-mcp
+
+The Wolpertinger Master Control Program (or wolper-mcp for short) can be used to access the scan results of wolpertinger scans from the database and print them in different formats.
+
+Furthermore, database reset and updates can be performed with this tool.
+
+
+## wolperctl
+
+The script wolperctl can be used to start/stop/restart/status a default listener and sender drone.
+

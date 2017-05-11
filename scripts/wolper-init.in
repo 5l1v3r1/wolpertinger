@@ -1,0 +1,31 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          wolpertinger-drones
+# Required-Start:    $remote_fs $network $syslog
+# Required-Stop:     $remote_fs $network $syslog
+# Default-Start:     3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: initscript for wolpertinger drones
+# Description:       initscript for wolpertinger drones
+### END INIT INFO
+
+WOLPERCTL="__WOLPER_BIN_DIR__/wolperctl"
+
+if [ ! -x "${WOLPERCTL}" ]; then
+	echo "Error: ${WOLPERCTL} not found or not executable."
+	exit 10
+fi
+
+if [ "$#" -lt "1" ]; then
+    "${WOLPERCTL}"
+fi
+
+case "$1" in
+    start|stop|restart|status)
+        "${WOLPERCTL}" "$1"
+		;;
+    *)
+        "${WOLPERCTL}"
+        ;;
+esac
+
